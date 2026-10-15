@@ -55,6 +55,7 @@ size_t   micSamples = 0;
 
 uint8_t* currentImageBuffer = nullptr;
 int touchStartX = 0;
+unsigned long pictureEnterMs = 0;
 
 unsigned long btnBPressStart = 0;
 bool btnBLongDone = false;
@@ -277,16 +278,20 @@ void drawKeyboardUI() {
 
 void drawPictureUI() {
     M5.Display.fillScreen(0);
-    if (currentImageBuffer)
+    if (currentImageBuffer) {
+        // Raw RGB565 from PC is little-endian packed; M5GFX often needs swap
+        M5.Display.setSwapBytes(true);
         M5.Display.pushImage(0, 0, 320, 240, (uint16_t*)currentImageBuffer);
-    else {
+        M5.Display.setSwapBytes(false);
+    } else {
         M5.Display.setTextColor(COLOR_WHITE, 0);
         M5.Display.setTextSize(2);
         M5.Display.setCursor(40, 100);
         M5.Display.print("No image yet");
     }
-    M5.Display.fillRect(0, 210, 320, 30, 0);
-    M5.Display.setTextColor(COLOR_WHITE, 0);
+    // Semi-transparent style hint bar (solid black strip)
+    M5.Display.fillRect(0, 210, 320, 30, 0x0000);
+    M5.Display.setTextColor(COLOR_WHITE, 0x0000);
     M5.Display.setTextSize(1);
     M5.Display.setCursor(20, 220);
     M5.Display.print("< Swipe Left=Delete   Swipe Right=Save >");
@@ -553,6 +558,8 @@ void requestImage(const String& prompt) {
 
         if (got >= need) {
             currentState = STATE_PICTURE;
+            pictureEnterMs = millis();
+            touchStartX = -1;  // no active swipe yet
             isBusy = false;
             drawPictureUI();
             return;
@@ -821,20 +828,28 @@ void loop() {
         if (y >= 240) return;
 
         if (currentState == STATE_PICTURE) {
-            if (t.wasPressed()) touchStartX = x;
-            if (t.wasReleased()) {
+            // Ignore leftover touches from keyboard OK / image download wait
+            if (millis() - pictureEnterMs < 500) {
+                return;
+            }
+            if (t.wasPressed()) {
+                touchStartX = x;
+            }
+            if (t.wasReleased() && touchStartX >= 0) {
                 int d = x - touchStartX;
-                if (d < -40) {
+                touchStartX = -1;
+                if (d < -50) {
                     if (currentImageBuffer) { free(currentImageBuffer); currentImageBuffer = nullptr; }
                     lastReply = "Discarded";
                     currentState = STATE_CHAT;
                     drawChatUI();
-                } else if (d > 40) {
+                } else if (d > 50) {
                     saveImageToSD();
                     if (currentImageBuffer) { free(currentImageBuffer); currentImageBuffer = nullptr; }
                     currentState = STATE_CHAT;
                     drawChatUI();
                 }
+                // small movement = stay on image (no-op)
             }
             return;
         }
