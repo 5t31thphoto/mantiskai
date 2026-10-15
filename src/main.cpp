@@ -5,498 +5,703 @@
 #include <mbedtls/base64.h>
 #include <Preferences.h>
 #include <SD.h>
-#include <SPI.h>
 #include <vector>
+#include <string.h>
 
 Preferences preferences;
 
-// ==========================================
-// CONFIGURATION & EDITABLE SETTINGS
-// ==========================================
-const char* WIFI_SSID = "DEFAULT_SSID";
-const char* WIFI_PASSWORD = "DEFAULT_PASSWORD";
-const char* PYTHON_SERVER_URL = "http://192.168.1.157:5000/api/chat"; 
-// ==========================================
+const char* DEFAULT_SSID     = "YOUR_WIFI_SSID";
+const char* DEFAULT_PASSWORD = "YOUR_WIFI_PASSWORD";
+const char* DEFAULT_SERVER   = "http://192.168.1.157:5000";
 
-String wifiSsid = WIFI_SSID;
-String wifiPassword = WIFI_PASSWORD;
-String serverUrl = PYTHON_SERVER_URL;
+String wifiSsid     = DEFAULT_SSID;
+String wifiPassword = DEFAULT_PASSWORD;
+String serverBase   = DEFAULT_SERVER;
 
-// Color Palette (#007373, #5d005d, #00ff00)
-#define COLOR_BG          0x0841  
-#define COLOR_TEAL        0x03A6  
-#define COLOR_PURPLE      0x580A  
-#define COLOR_GREEN       0x07E0  
-#define COLOR_WHITE       0xFFFF
-#define COLOR_RED         0xF800
+#define COLOR_BG      0x0841
+#define COLOR_TEAL    0x03A6
+#define COLOR_PURPLE  0x580A
+#define COLOR_GREEN   0x07E0
+#define COLOR_WHITE   0xFFFF
+#define COLOR_RED     0xF800
+#define COLOR_DARK    0x2104
 
 enum AppState { STATE_CHAT, STATE_SETTINGS, STATE_KEYBOARD, STATE_PICTURE };
 AppState currentState = STATE_CHAT;
 
-String lastReply = "Ready. Tap screen to chat or record.";
+String lastReply = "Ready. Type or press A for Image.";
 bool isConnected = false;
+bool isBusy      = false;
 bool isRecording = false;
 
-// Image Generation & Model State
-String modelMode = "realistic"; // "realistic" or "anime"
-std::vector<String> loraNames = {"detailer.safetensors", "cyberpunk.safetensors"};
-int activeLoraIdx = -1; // -1 = No LoRA
+String modelMode  = "realistic";
+String activeLora = "None";
 
-unsigned long buttonBPressTime = 0;
-bool buttonBHeld = false;
-
-// Keyboard editing state
 String* activeEditingField = nullptr;
 String keyboardBuffer = "";
-String keyboardTitle = "";
-
-enum KeyboardMode { MODE_LOWER, MODE_UPPER, MODE_SYMS };
+String keyboardTitle  = "";
+enum KeyboardMode { MODE_LOWER, MODE_UPPER, MODE_SYMBOLS };
 KeyboardMode kbMode = MODE_LOWER;
+bool shiftHeld = false;
 
-// Audio Recording Buffers
-#define RECORD_TIME_SEC   4
-#define SAMPLE_RATE       16000
+#define RECORD_SECONDS 4
+#define SAMPLE_RATE    16000
 int16_t* micBuffer = nullptr;
-size_t bufferSize = 0;
+size_t   micSamples = 0;
 
-// Picture Mode buffer
 uint8_t* currentImageBuffer = nullptr;
 int touchStartX = 0;
-int touchEndX = 0;
 
+unsigned long btnBPressStart = 0;
+bool btnBLongDone = false;
+
+void drawChatUI();
+void drawSettingsUI();
+void drawKeyboardUI();
+void drawPictureUI();
+void connectWiFi();
+void sendChat(const String& msg);
+void fetchAndPlayTTS(const String& text);
+void requestImage(const String& prompt);
+void cycleLora();
+void clearLora();
+void startRecording();
+
+// ---------- settings ----------
 void loadSettings() {
-    // 1. Try loading from SD Card config file first
-    if (SD.begin(4)) {
-        if (SD.exists("/wifi_config.json")) {
-            File file = SD.open("/wifi_config.json", FILE_READ);
-            if (file) {
-                StaticJsonDocument<512> doc;
-                DeserializationError error = deserializeJson(doc, file);
-                if (!error) {
-                    if (doc.containsKey("ssid")) wifiSsid = doc["ssid"].as<String>();
-                    if (doc.containsKey("pass")) wifiPassword = doc["pass"].as<String>();
-                }
-                file.close();
+    if (SD.begin(4) && SD.exists("/wifi_config.json")) {
+        File f = SD.open("/wifi_config.json", FILE_READ);
+        if (f) {
+            JsonDocument doc;
+            if (!deserializeJson(doc, f)) {
+                if (doc["ssid"].is<const char*>())   wifiSsid     = doc["ssid"].as<String>();
+                if (doc["pass"].is<const char*>())   wifiPassword = doc["pass"].as<String>();
+                if (doc["server"].is<const char*>()) serverBase   = doc["server"].as<String>();
             }
+            f.close();
         }
     }
-
-    // 2. Fallback to NVS Preferences for Wi-Fi only, force serverUrl to code constant
     preferences.begin("mantiskai", true);
-    wifiSsid = preferences.getString("ssid", wifiSsid);
-    wifiPassword = preferences.getString("pass", wifiPassword);
+    wifiSsid     = preferences.getString("ssid",   wifiSsid);
+    wifiPassword = preferences.getString("pass",   wifiPassword);
+    serverBase   = preferences.getString("server", serverBase);
     preferences.end();
-
-    // FORCE the server URL to match your hardcoded constant so NVS can't override it with a bad string
-    serverUrl = PYTHON_SERVER_URL;
+    if (serverBase.endsWith("/")) serverBase.remove(serverBase.length() - 1);
 }
 
 void saveSettings() {
     preferences.begin("mantiskai", false);
     preferences.putString("ssid", wifiSsid);
     preferences.putString("pass", wifiPassword);
-    preferences.putString("server", serverUrl);
+    preferences.putString("server", serverBase);
     preferences.end();
+    if (SD.begin(4)) {
+        File f = SD.open("/wifi_config.json", FILE_WRITE);
+        if (f) {
+            JsonDocument doc;
+            doc["ssid"] = wifiSsid; doc["pass"] = wifiPassword; doc["server"] = serverBase;
+            serializeJson(doc, f);
+            f.close();
+        }
+    }
 }
 
 void connectWiFi() {
+    WiFi.disconnect(true);
+    delay(80);
+    WiFi.mode(WIFI_STA);
     WiFi.begin(wifiSsid.c_str(), wifiPassword.c_str());
-    int attempts = 0;
-    while (WiFi.status() != WL_CONNECTED && attempts < 15) {
-        delay(500);
-        attempts++;
-    }
+    int n = 0;
+    while (WiFi.status() != WL_CONNECTED && n++ < 20) delay(500);
     isConnected = (WiFi.status() == WL_CONNECTED);
+}
+
+// ---------- UI ----------
+void drawHeader(const char* title, uint16_t color = COLOR_TEAL) {
+    M5.Display.fillRect(0, 0, 320, 32, color);
+    M5.Display.setTextColor(COLOR_WHITE, color);
+    M5.Display.setTextSize(2);
+    M5.Display.setCursor(8, 6);
+    M5.Display.print(title);
+    M5.Display.fillCircle(300, 16, 7, isConnected ? COLOR_GREEN : COLOR_RED);
 }
 
 void drawChatUI() {
     M5.Display.fillScreen(COLOR_BG);
+    drawHeader("MantisKAI Chat");
 
-    // Header Bar
-    M5.Display.fillRect(0, 0, 320, 35, COLOR_TEAL);
-    M5.Display.setTextColor(COLOR_WHITE, COLOR_TEAL);
-    M5.Display.setTextSize(2);
-    M5.Display.setCursor(10, 8);
-    M5.Display.print("MantisKAI Chat");
-
-    // Settings Button Top Right
-    M5.Display.fillRect(270, 5, 40, 25, COLOR_PURPLE);
+    M5.Display.fillRoundRect(255, 4, 30, 24, 4, COLOR_PURPLE);
     M5.Display.setTextSize(1);
-    M5.Display.setCursor(278, 12);
+    M5.Display.setCursor(261, 10);
     M5.Display.print("CFG");
 
-    // Status Dot
-    M5.Display.fillCircle(250, 18, 6, isConnected ? COLOR_GREEN : COLOR_RED);
-
-    // Chat Box Area
-    M5.Display.drawRect(10, 45, 300, 125, COLOR_PURPLE);
+    M5.Display.drawRoundRect(8, 40, 304, 110, 6, COLOR_PURPLE);
     M5.Display.setTextColor(COLOR_WHITE, COLOR_BG);
     M5.Display.setTextSize(1);
-    M5.Display.setCursor(15, 52);
-    M5.Display.print(isRecording ? "RECORDING VOICE..." : "AI Response:");
-    
-    M5.Display.setCursor(15, 70);
-    M5.Display.setTextSize(2);
-    M5.Display.setTextColor(isRecording ? COLOR_RED : COLOR_GREEN, COLOR_BG);
-    
-    String displayStr = lastReply;
-    if (displayStr.length() > 80) displayStr = displayStr.substring(0, 77) + "...";
-    M5.Display.println(displayStr);
+    M5.Display.setCursor(14, 46);
+    M5.Display.print(isBusy ? "Thinking..." : "AI Reply:");
 
-    // Model & LoRA Status Bar
-    M5.Display.fillRect(10, 175, 300, 22, 0x1ef8);
+    M5.Display.setTextColor(COLOR_GREEN, COLOR_BG);
+    String r = lastReply;
+    int y = 62;
+    while (r.length() && y < 140) {
+        String line = r.substring(0, 38);
+        int sp = line.lastIndexOf(' ');
+        if (sp > 20 && r.length() > 38) { line = r.substring(0, sp); r = r.substring(sp + 1); }
+        else r = r.substring(line.length());
+        M5.Display.setCursor(14, y);
+        M5.Display.print(line);
+        y += 14;
+    }
+
+    M5.Display.fillRoundRect(8, 158, 304, 22, 4, 0x1ef8);
     M5.Display.setTextColor(COLOR_WHITE, 0x1ef8);
     M5.Display.setTextSize(1);
-    M5.Display.setCursor(15, 182);
-    String loraStatus = (activeLoraIdx >= 0 && activeLoraIdx < (int)loraNames.size()) ? loraNames[activeLoraIdx] : "None";
-    M5.Display.print("M: " + modelMode + " | LoRA: " + loraStatus);
+    M5.Display.setCursor(14, 164);
+    M5.Display.printf("M:%s | LoRA:%s", modelMode.c_str(), activeLora.c_str());
 
-    // Bottom Action Buttons
-    M5.Display.fillRect(10, 205, 140, 35, COLOR_PURPLE);
+    M5.Display.fillRoundRect(8, 190, 148, 42, 6, COLOR_PURPLE);
     M5.Display.setTextColor(COLOR_WHITE, COLOR_PURPLE);
-    M5.Display.setTextSize(1);
-    M5.Display.setCursor(35, 217);
-    M5.Display.print("SEND TEXT");
+    M5.Display.setTextSize(2);
+    M5.Display.setCursor(30, 202);
+    M5.Display.print("TYPE");
 
-    M5.Display.fillRect(170, 205, 140, 35, isRecording ? COLOR_RED : COLOR_TEAL);
-    M5.Display.setTextColor(COLOR_WHITE, isRecording ? COLOR_RED : COLOR_TEAL);
-    M5.Display.setCursor(195, 217);
-    M5.Display.print(isRecording ? "STOP & SEND" : "RECORD VOICE");
+    M5.Display.fillRoundRect(164, 190, 148, 42, 6, COLOR_TEAL);
+    M5.Display.setTextColor(COLOR_WHITE, COLOR_TEAL);
+    M5.Display.setCursor(178, 202);
+    M5.Display.print("MIC");
 }
 
 void drawSettingsUI() {
     M5.Display.fillScreen(COLOR_BG);
-
-    // Header
-    M5.Display.fillRect(0, 0, 320, 35, COLOR_PURPLE);
-    M5.Display.setTextColor(COLOR_WHITE, COLOR_PURPLE);
-    M5.Display.setTextSize(2);
-    M5.Display.setCursor(10, 8);
-    M5.Display.print("Device Settings");
-
+    drawHeader("Settings", COLOR_PURPLE);
     M5.Display.setTextSize(1);
     M5.Display.setTextColor(COLOR_WHITE, COLOR_BG);
 
-    // SSID Row
-    M5.Display.setCursor(15, 45);
-    M5.Display.print("Wi-Fi SSID:");
-    M5.Display.fillRect(15, 60, 290, 25, 0x1ef8);
-    M5.Display.setCursor(20, 66);
-    M5.Display.print(wifiSsid);
+    M5.Display.setCursor(12, 42); M5.Display.print("Wi-Fi SSID");
+    M5.Display.fillRoundRect(12, 56, 296, 28, 4, COLOR_DARK);
+    M5.Display.setCursor(18, 64); M5.Display.print(wifiSsid);
 
-    // Password Row
-    M5.Display.setCursor(15, 95);
-    M5.Display.print("Wi-Fi Password:");
-    M5.Display.fillRect(15, 110, 290, 25, 0x1ef8);
-    M5.Display.setCursor(20, 116);
-    M5.Display.print("********");
+    M5.Display.setCursor(12, 92); M5.Display.print("Wi-Fi Password");
+    M5.Display.fillRoundRect(12, 106, 296, 28, 4, COLOR_DARK);
+    M5.Display.setCursor(18, 114); M5.Display.print("********");
 
-    // Server URL Row
-    M5.Display.setCursor(15, 145);
-    M5.Display.print("PC Server URL:");
-    M5.Display.fillRect(15, 160, 290, 25, 0x1ef8);
-    M5.Display.setCursor(20, 166);
-    M5.Display.print(serverUrl);
+    M5.Display.setCursor(12, 142); M5.Display.print("PC Server (base URL)");
+    M5.Display.fillRoundRect(12, 156, 296, 28, 4, COLOR_DARK);
+    M5.Display.setCursor(18, 164); M5.Display.print(serverBase);
 
-    // Bottom Navigation Buttons
-    M5.Display.fillRect(10, 200, 145, 35, COLOR_TEAL);
+    M5.Display.fillRoundRect(12, 200, 140, 36, 6, COLOR_TEAL);
     M5.Display.setTextColor(COLOR_WHITE, COLOR_TEAL);
-    M5.Display.setCursor(45, 212);
-    M5.Display.print("< BACK");
+    M5.Display.setTextSize(2);
+    M5.Display.setCursor(40, 210); M5.Display.print("BACK");
 
-    M5.Display.fillRect(165, 200, 145, 35, COLOR_GREEN);
-    M5.Display.setTextColor(0x0000, COLOR_GREEN);
-    M5.Display.setCursor(195, 212);
-    M5.Display.print("SAVE & CONNECT");
+    M5.Display.fillRoundRect(168, 200, 140, 36, 6, COLOR_GREEN);
+    M5.Display.setTextColor(0, COLOR_GREEN);
+    M5.Display.setCursor(185, 210); M5.Display.print("SAVE");
 }
+
+const char* rowsL[] = {"1234567890", "qwertyuiop", "asdfghjkl", "zxcvbnm"};
+const char* rowsU[] = {"1234567890", "QWERTYUIOP", "ASDFGHJKL", "ZXCVBNM"};
+const char* rowsS[] = {"!@#$%^&*()", "-_=+[]{}|\\", ";:'\",.<>/?", "`~"};
 
 void drawKeyboardUI() {
     M5.Display.fillScreen(COLOR_BG);
-
-    M5.Display.fillRect(0, 0, 320, 30, COLOR_TEAL);
+    M5.Display.fillRect(0, 0, 320, 28, COLOR_TEAL);
     M5.Display.setTextColor(COLOR_WHITE, COLOR_TEAL);
     M5.Display.setTextSize(1);
-    M5.Display.setCursor(10, 10);
-    String modeStr = (kbMode == MODE_LOWER) ? "[abc]" : (kbMode == MODE_UPPER) ? "[ABC]" : "[SYM]";
-    M5.Display.print("Edit: " + keyboardTitle + " " + modeStr);
+    M5.Display.setCursor(8, 8);
+    const char* ms = kbMode == MODE_LOWER ? "[abc]" : kbMode == MODE_UPPER ? "[ABC]" : "[SYM]";
+    M5.Display.printf("%s  %s", keyboardTitle.c_str(), ms);
 
-    M5.Display.drawRect(10, 35, 300, 30, COLOR_PURPLE);
+    M5.Display.drawRoundRect(6, 32, 308, 30, 4, COLOR_PURPLE);
     M5.Display.setTextColor(COLOR_GREEN, COLOR_BG);
     M5.Display.setTextSize(2);
-    M5.Display.setCursor(15, 42);
-    M5.Display.print(keyboardBuffer);
+    M5.Display.setCursor(12, 38);
+    String shown = keyboardBuffer;
+    if (shown.length() > 22) shown = "..." + shown.substring(shown.length() - 19);
+    M5.Display.print(shown);
 
-    String r0 = "1234567890";
-    String r1 = (kbMode == MODE_UPPER) ? "QWERTYUIOP" : "qwertyuiop";
-    String r2 = (kbMode == MODE_UPPER) ? "ASDFGHJKL:" : "asdfghjkl;";
-    String r3 = (kbMode == MODE_SYMS) ? "-_+=;:/?.,$" : ((kbMode == MODE_UPPER) ? "ZXCVBNM" : "zxcvbnm");
-
-    // Row 0: Numbers
-    int len0 = r0.length();
-    int btnW0 = 300 / len0;
-    for (int c = 0; c < len0; c++) {
-        int x = 10 + (c * btnW0);
-        int y = 75;
-        M5.Display.fillRect(x + 1, y + 1, btnW0 - 2, 32, 0x2a2a);
-        M5.Display.drawRect(x, y, btnW0, 34, COLOR_PURPLE);
-        M5.Display.setTextColor(COLOR_WHITE, 0x2a2a);
-        M5.Display.setTextSize(1);
-        M5.Display.setCursor(x + 4, y + 10);
-        M5.Display.print(r0[c]);
-    }
-
-    // Row 1: QWERTY
-    int len1 = r1.length();
-    int btnW1 = 300 / len1;
-    for (int c = 0; c < len1; c++) {
-        int x = 10 + (c * btnW1);
-        int y = 110;
-        M5.Display.fillRect(x + 1, y + 1, btnW1 - 2, 32, 0x2a2a);
-        M5.Display.drawRect(x, y, btnW1, 34, COLOR_PURPLE);
-        M5.Display.setTextColor(COLOR_WHITE, 0x2a2a);
-        M5.Display.setTextSize(1);
-        M5.Display.setCursor(x + 4, y + 10);
-        M5.Display.print(r1[c]);
-    }
-
-    // Row 2: ASDFGH
-    int len2 = r2.length();
-    int btnW2 = 300 / len2;
-    for (int c = 0; c < len2; c++) {
-        int x = 10 + (c * btnW2);
-        int y = 145;
-        M5.Display.fillRect(x + 1, y + 1, btnW2 - 2, 32, 0x2a2a);
-        M5.Display.drawRect(x, y, btnW2, 34, COLOR_PURPLE);
-        M5.Display.setTextColor(COLOR_WHITE, 0x2a2a);
-        M5.Display.setTextSize(1);
-        M5.Display.setCursor(x + 4, y + 10);
-        M5.Display.print(r2[c]);
-    }
-
-    // Row 3: Special controls (Shift, Sym, Backspace, OK)
-    const char* labels[4] = {
-        (kbMode == MODE_UPPER) ? "abc" : "ABC", 
-        (kbMode == MODE_SYMS) ? "abc" : "SYM", 
-        "<-", 
-        "OK"
-    };
-    int bWidth = 300 / 4;
-    for (int i = 0; i < 4; i++) {
-        int x = 10 + (i * bWidth);
-        int y = 180;
-        uint16_t btnColor = (i == 3) ? COLOR_GREEN : ((i == 2) ? COLOR_RED : 0x2a2a);
-        M5.Display.fillRect(x + 1, y + 1, bWidth - 2, 35, btnColor);
-        M5.Display.drawRect(x, y, bWidth, 37, COLOR_PURPLE);
-        M5.Display.setTextColor((i == 3) ? 0x0000 : COLOR_WHITE, btnColor);
-        M5.Display.setTextSize(1);
-        M5.Display.setCursor(x + (bWidth / 2) - 10, y + 12);
-        M5.Display.print(labels[i]);
-    }
-
-    // Row 4: ZXCVBNM letter keys
-    int len4 = r3.length();
-    int btnW4 = 300 / len4;
-    for (int c = 0; c < len4; c++) {
-        int x = 10 + (c * btnW4);
-        int y = 220;
-        M5.Display.fillRect(x + 1, y + 1, btnW4 - 2, 28, 0x2a2a);
-        M5.Display.drawRect(x, y, btnW4, 30, COLOR_PURPLE);
-        M5.Display.setTextColor(COLOR_WHITE, 0x2a2a);
-        M5.Display.setTextSize(1);
-        M5.Display.setCursor(x + 4, y + 8);
-        M5.Display.print(r3[c]);
-    }
-}
-
-void handleKeyboardTouch(int touchX, int touchY) {
-    if (touchY >= 75 && touchY <= 109) {
-        String r0 = "1234567890";
-        int btnW = 300 / r0.length();
-        int idx = (touchX - 10) / btnW;
-        if (idx >= 0 && idx < (int)r0.length()) {
-            keyboardBuffer += r0[idx];
-            drawKeyboardUI();
+    const char** rows = kbMode == MODE_LOWER ? rowsL : kbMode == MODE_UPPER ? rowsU : rowsS;
+    for (int r = 0; r < 4; r++) {
+        String row = rows[r];
+        int keyW = 300 / row.length();
+        int x0 = (320 - keyW * row.length()) / 2;
+        for (int c = 0; c < (int)row.length(); c++) {
+            int x = x0 + c * keyW, y = 68 + r * 36;
+            M5.Display.fillRoundRect(x+1, y+1, keyW-2, 30, 3, COLOR_DARK);
+            M5.Display.drawRoundRect(x, y, keyW, 32, 3, COLOR_PURPLE);
+            M5.Display.setTextColor(COLOR_WHITE, COLOR_DARK);
+            M5.Display.setTextSize(2);
+            M5.Display.setCursor(x + keyW/2 - 6, y + 6);
+            M5.Display.print(row[c]);
         }
-        return;
     }
-    if (touchY >= 110 && touchY <= 144) {
-        String r1 = (kbMode == MODE_UPPER) ? "QWERTYUIOP" : "qwertyuiop";
-        int btnW = 300 / r1.length();
-        int idx = (touchX - 10) / btnW;
-        if (idx >= 0 && idx < (int)r1.length()) {
-            keyboardBuffer += r1[idx];
-            drawKeyboardUI();
-        }
-        return;
-    }
-    if (touchY >= 145 && touchY <= 179) {
-        String r2 = (kbMode == MODE_UPPER) ? "ASDFGHJKL:" : "asdfghjkl;";
-        int btnW = 300 / r2.length();
-        int idx = (touchX - 10) / btnW;
-        if (idx >= 0 && idx < (int)r2.length()) {
-            keyboardBuffer += r2[idx];
-            drawKeyboardUI();
-        }
-        return;
-    }
-    if (touchY >= 180 && touchY <= 216) {
-        int bWidth = 300 / 4;
-        int idx = (touchX - 10) / bWidth;
-        if (idx == 0) { 
-            if (kbMode == MODE_UPPER) kbMode = MODE_LOWER;
-            else kbMode = MODE_UPPER;
-        } else if (idx == 1) { 
-            if (kbMode == MODE_SYMS) kbMode = MODE_LOWER;
-            else kbMode = MODE_SYMS;
-        } else if (idx == 2) { 
-            if (keyboardBuffer.length() > 0) keyboardBuffer.remove(keyboardBuffer.length() - 1);
-        } else if (idx == 3) { 
-            if (activeEditingField) *activeEditingField = keyboardBuffer;
-            currentState = STATE_SETTINGS;
-            drawSettingsUI();
-            return;
-        }
-        drawKeyboardUI();
-        return;
-    }
-    if (touchY >= 217 && touchY <= 247) {
-        String r3 = (kbMode == MODE_SYMS) ? "-_+=;:/?.,$" : ((kbMode == MODE_UPPER) ? "ZXCVBNM" : "zxcvbnm");
-        int btnW = 300 / r3.length();
-        int idx = (touchX - 10) / btnW;
-        if (idx >= 0 && idx < (int)r3.length()) {
-            keyboardBuffer += r3[idx];
-            drawKeyboardUI();
-        }
-        return;
-    }
+    int y = 210;
+    uint16_t sh = (kbMode == MODE_UPPER || shiftHeld) ? COLOR_TEAL : COLOR_DARK;
+    M5.Display.fillRoundRect(4, y, 60, 28, 4, sh);
+    M5.Display.setTextColor(COLOR_WHITE, sh);
+    M5.Display.setTextSize(1);
+    M5.Display.setCursor(16, y+8); M5.Display.print("SHIFT");
+
+    M5.Display.fillRoundRect(68, y, 100, 28, 4, COLOR_DARK);
+    M5.Display.setTextColor(COLOR_WHITE, COLOR_DARK);
+    M5.Display.setCursor(100, y+8); M5.Display.print("SPACE");
+
+    M5.Display.fillRoundRect(172, y, 60, 28, 4, COLOR_DARK);
+    M5.Display.setCursor(184, y+8); M5.Display.print(kbMode == MODE_SYMBOLS ? "ABC" : "SYM");
+
+    M5.Display.fillRoundRect(236, y, 40, 28, 4, COLOR_RED);
+    M5.Display.setTextColor(COLOR_WHITE, COLOR_RED);
+    M5.Display.setCursor(246, y+8); M5.Display.print("<-");
+
+    M5.Display.fillRoundRect(280, y, 36, 28, 4, COLOR_GREEN);
+    M5.Display.setTextColor(0, COLOR_GREEN);
+    M5.Display.setCursor(288, y+8); M5.Display.print("OK");
 }
 
 void drawPictureUI() {
-    M5.Display.fillScreen(0x0000);
-    if (currentImageBuffer) {
+    M5.Display.fillScreen(0);
+    if (currentImageBuffer)
         M5.Display.pushImage(0, 0, 320, 240, (uint16_t*)currentImageBuffer);
+    else {
+        M5.Display.setTextColor(COLOR_WHITE, 0);
+        M5.Display.setTextSize(2);
+        M5.Display.setCursor(40, 100);
+        M5.Display.print("No image yet");
     }
-    M5.Display.fillRect(0, 210, 320, 30, 0x0000);
-    M5.Display.setTextColor(0xFFFF, 0x0000);
+    M5.Display.fillRect(0, 210, 320, 30, 0);
+    M5.Display.setTextColor(COLOR_WHITE, 0);
     M5.Display.setTextSize(1);
-    M5.Display.setCursor(10, 220);
-    M5.Display.print("< Swipe Left: Delete  |  Swipe Right: Save >");
+    M5.Display.setCursor(20, 220);
+    M5.Display.print("< Swipe Left=Delete   Swipe Right=Save >");
 }
 
-void saveImageToSD() {
-    if (!currentImageBuffer) return;
-    if (!SD.begin(4)) return;
-
-    if (!SD.exists("/images")) SD.mkdir("/images");
-    if (!SD.exists("/images/comfy")) SD.mkdir("/images/comfy");
-
-    String filename = "/images/comfy/img_" + String(millis()) + ".mg";
-    File file = SD.open(filename.c_str(), FILE_WRITE);
-    if (file) {
-        file.write(currentImageBuffer, 320 * 240 * 2);
-        file.close();
-        lastReply = "Saved to SD: " + filename;
+void handleKeyboardTouch(int tx, int ty) {
+    if (ty < 68) return;
+    if (ty < 210) {
+        int row = (ty - 68) / 36;
+        if (row < 0 || row > 3) return;
+        const char** rows = kbMode == MODE_LOWER ? rowsL : kbMode == MODE_UPPER ? rowsU : rowsS;
+        String r = rows[row];
+        int keyW = 300 / r.length();
+        int x0 = (320 - keyW * r.length()) / 2;
+        int col = (tx - x0) / keyW;
+        if (col >= 0 && col < (int)r.length()) {
+            char ch = r[col];
+            if (shiftHeld && kbMode == MODE_LOWER && ch >= 'a' && ch <= 'z') {
+                ch -= 32; shiftHeld = false;
+            }
+            keyboardBuffer += ch;
+            drawKeyboardUI();
+        }
+        return;
+    }
+    if (ty >= 210) {
+        if (tx < 64) {
+            if (kbMode == MODE_SYMBOLS) kbMode = MODE_LOWER;
+            else if (kbMode == MODE_LOWER) { kbMode = MODE_UPPER; shiftHeld = true; }
+            else { kbMode = MODE_LOWER; shiftHeld = false; }
+            drawKeyboardUI();
+        } else if (tx < 168) {
+            keyboardBuffer += " "; drawKeyboardUI();
+        } else if (tx < 232) {
+            kbMode = kbMode == MODE_SYMBOLS ? MODE_LOWER : MODE_SYMBOLS;
+            shiftHeld = false; drawKeyboardUI();
+        } else if (tx < 276) {
+            if (keyboardBuffer.length()) keyboardBuffer.remove(keyboardBuffer.length() - 1);
+            drawKeyboardUI();
+        } else {
+            if (activeEditingField) {
+                *activeEditingField = keyboardBuffer;
+                currentState = STATE_SETTINGS;
+                drawSettingsUI();
+            } else {
+                String msg = keyboardBuffer;
+                keyboardBuffer = "";
+                bool img = (keyboardTitle == "Image Prompt");
+                currentState = STATE_CHAT;
+                drawChatUI();
+                if (msg.length()) {
+                    if (img) requestImage(msg);
+                    else sendChat(msg);
+                }
+            }
+        }
     }
 }
 
-
-void sendPayloadToServer(String message, String audioBase64 = "") {
+// ---------- network ----------
+void sendChat(const String& msg) {
     if (WiFi.status() != WL_CONNECTED) {
         isConnected = false;
         lastReply = "Wi-Fi disconnected";
-        Serial.println("[NET] Wi-Fi is not connected");
         drawChatUI();
         return;
     }
-
     isConnected = true;
+    isBusy = true;
+    drawChatUI();
 
-    // FIX: Instantiate an explicit WiFiClient for stable socket handling
-    WiFiClient wifiClient;
+    WiFiClient client;
     HTTPClient http;
-    
-    http.setConnectTimeout(5000);
-    http.setTimeout(30000);
-    http.setReuse(false); // Prevent stale keep-alive connection reuse errors
+    http.setConnectTimeout(8000);
+    http.setTimeout(45000);
+    http.setReuse(false);
+    http.useHTTP10(true);
 
-    Serial.printf("[HTTP] Connecting to %s\n", serverUrl.c_str());
-
-    // FIX: Pass the wifiClient instance explicitly to http.begin()
-    if (!http.begin(wifiClient, serverUrl)) {
-        lastReply = "Invalid server URL";
-        Serial.println("[HTTP] http.begin() failed");
+    String url = serverBase + "/api/chat";
+    if (!http.begin(client, url)) {
+        lastReply = "Bad URL";
+        isBusy = false;
         drawChatUI();
         return;
     }
-
     http.addHeader("Content-Type", "application/json");
 
-    JsonDocument doc;
-    if (message.length() > 0) doc["message"] = message;
-    if (audioBase64.length() > 0) doc["audio_base64"] = audioBase64;
+    JsonDocument body;
+    body["message"] = msg;
+    String bodyStr;
+    serializeJson(body, bodyStr);
 
-    String requestBody;
-    serializeJson(doc, requestBody);
-
-    int code = http.POST(requestBody);
-
+    int code = http.POST(bodyStr);
     if (code > 0) {
-        String body = http.getString();
-        JsonDocument responseDoc;
-        DeserializationError err = deserializeJson(responseDoc, body);
-
-        if (err) {
-            lastReply = "Bad JSON response";
-        } else if (code < 200 || code >= 300) {
-            lastReply = responseDoc["error"] | "Server returned HTTP error";
-        } else if (responseDoc["reply"].is<const char*>()) {
-            lastReply = responseDoc["reply"].as<String>();
-
-            String responseAudio = responseDoc["audio_base64"].as<String>();
-            if (responseAudio.length() > 0) {
-                size_t decodedLen = 0;
-                int rc = mbedtls_base64_decode(
-                    nullptr, 0, &decodedLen,
-                    (const unsigned char*)responseAudio.c_str(),
-                    responseAudio.length());
-
-                if (rc == 0 && decodedLen > 0) {
-                    auto* audioBytes = (unsigned char*)malloc(decodedLen);
-                    if (audioBytes) {
-                        size_t actualLen = 0;
-                        rc = mbedtls_base64_decode(
-                            audioBytes, decodedLen, &actualLen,
-                            (const unsigned char*)responseAudio.c_str(),
-                            responseAudio.length());
-
-                        if (rc == 0) {
-                            M5.Speaker.begin();
-                            M5.Speaker.playRaw(
-                                (const uint8_t*)audioBytes,
-                                actualLen, 22050, false, 1, 0);
-                        }
-                        free(audioBytes);
-                    }
-                }
+        String resp = http.getString();
+        JsonDocument doc;
+        if (!deserializeJson(doc, resp)) {
+            if (doc["lora"].is<const char*>()) activeLora = doc["lora"].as<String>();
+            if (doc["reply"].is<const char*>()) {
+                lastReply = doc["reply"].as<String>();
+                http.end();
+                isBusy = false;
+                drawChatUI();
+                // second request: binary WAV
+                fetchAndPlayTTS(lastReply);
+                return;
             }
+            if (doc["error"].is<const char*>()) lastReply = doc["error"].as<String>();
+            else lastReply = "No reply";
         } else {
-            lastReply = responseDoc["error"] | "Missing reply in JSON";
+            lastReply = "Bad JSON";
         }
     } else {
         lastReply = http.errorToString(code);
-        Serial.printf("[HTTP] Connection failed: %s\n", lastReply.c_str());
     }
-
     http.end();
+    isBusy = false;
     drawChatUI();
 }
 
+void fetchAndPlayTTS(const String& text) {
+    if (text.length() == 0 || WiFi.status() != WL_CONNECTED) return;
 
+    WiFiClient client;
+    HTTPClient http;
+    http.setConnectTimeout(5000);
+    http.setTimeout(30000);
+    http.setReuse(false);
+    http.useHTTP10(true);
+
+    String url = serverBase + "/api/tts";
+    if (!http.begin(client, url)) return;
+    http.addHeader("Content-Type", "application/json");
+
+    JsonDocument body;
+    body["text"] = text;
+    String bodyStr;
+    serializeJson(body, bodyStr);
+
+    int code = http.POST(bodyStr);
+    if (code == 200) {
+        int len = http.getSize();
+        if (len > 0 && len < 200000) {
+            uint8_t* buf = (uint8_t*)malloc(len);
+            if (buf) {
+                int got = http.getStream().readBytes(buf, len);
+                if (got > 44) {  // minimal WAV header
+                    // skip 44-byte WAV header, play PCM16 mono
+                    M5.Speaker.begin();
+                    M5.Speaker.playRaw(buf + 44, got - 44, 22050, false, 1, 0);
+                }
+                free(buf);
+            }
+        }
+    }
+    http.end();
+}
+
+void requestImage(const String& prompt) {
+    if (WiFi.status() != WL_CONNECTED) {
+        lastReply = "Wi-Fi disconnected";
+        drawChatUI();
+        return;
+    }
+    isBusy = true;
+    lastReply = "Generating image...";
+    drawChatUI();
+
+    WiFiClient client;
+    HTTPClient http;
+    http.setConnectTimeout(10000);
+    http.setTimeout(120000);
+    http.setReuse(false);
+    http.useHTTP10(true);
+
+    String url = serverBase + "/api/image";
+    if (!http.begin(client, url)) {
+        lastReply = "Bad URL";
+        isBusy = false;
+        drawChatUI();
+        return;
+    }
+    http.addHeader("Content-Type", "application/json");
+
+    JsonDocument body;
+    body["prompt"] = prompt;
+    body["model_type"] = modelMode;
+    if (activeLora != "None") body["lora"] = activeLora;
+    String bodyStr;
+    serializeJson(body, bodyStr);
+
+    int code = http.POST(bodyStr);
+    if (code == 200) {
+        String resp = http.getString();
+        JsonDocument doc;
+        if (!deserializeJson(doc, resp)) {
+            if (doc["lora"].is<const char*>()) activeLora = doc["lora"].as<String>();
+            if (doc["image_base64"].is<const char*>()) {
+                String b64 = doc["image_base64"].as<String>();
+                size_t outLen = 0;
+                mbedtls_base64_decode(nullptr, 0, &outLen,
+                    (const unsigned char*)b64.c_str(), b64.length());
+                const size_t need = 320UL * 240UL * 2UL;
+                if (outLen >= need) {
+                    if (currentImageBuffer) free(currentImageBuffer);
+                    currentImageBuffer = (uint8_t*)malloc(need);
+                    if (currentImageBuffer) {
+                        size_t actual = 0;
+                        if (mbedtls_base64_decode(currentImageBuffer, need, &actual,
+                                (const unsigned char*)b64.c_str(), b64.length()) == 0) {
+                            currentState = STATE_PICTURE;
+                            isBusy = false;
+                            drawPictureUI();
+                            http.end();
+                            return;
+                        }
+                    }
+                }
+                lastReply = "Bad image data";
+            } else {
+                lastReply = doc["error"] | "No image";
+            }
+        } else {
+            lastReply = "Bad JSON";
+        }
+    } else {
+        lastReply = http.errorToString(code);
+    }
+    http.end();
+    isBusy = false;
+    currentState = STATE_CHAT;
+    drawChatUI();
+}
+
+void cycleLora() {
+    if (WiFi.status() != WL_CONNECTED) return;
+    WiFiClient client;
+    HTTPClient http;
+    http.setConnectTimeout(4000);
+    http.setTimeout(6000);
+    http.setReuse(false);
+    http.useHTTP10(true);
+    if (!http.begin(client, serverBase + "/api/lora")) return;
+    http.addHeader("Content-Type", "application/json");
+    if (http.POST("{\"action\":\"cycle\"}") == 200) {
+        String resp = http.getString();
+        JsonDocument doc;
+        if (!deserializeJson(doc, resp) && doc["lora"].is<const char*>()) {
+            activeLora = doc["lora"].as<String>();
+            lastReply = String("LoRA → ") + activeLora;
+        }
+    }
+    http.end();
+    if (currentState == STATE_CHAT) drawChatUI();
+}
+
+void clearLora() {
+    if (WiFi.status() != WL_CONNECTED) return;
+    WiFiClient client;
+    HTTPClient http;
+    http.setConnectTimeout(4000);
+    http.setTimeout(6000);
+    http.setReuse(false);
+    http.useHTTP10(true);
+    if (!http.begin(client, serverBase + "/api/lora")) return;
+    http.addHeader("Content-Type", "application/json");
+    if (http.POST("{\"action\":\"clear\"}") == 200) {
+        String resp = http.getString();
+        JsonDocument doc;
+        if (!deserializeJson(doc, resp) && doc["lora"].is<const char*>()) {
+            activeLora = doc["lora"].as<String>();
+            lastReply = String("LoRA → ") + activeLora;
+        }
+    }
+    http.end();
+    if (currentState == STATE_CHAT) drawChatUI();
+}
+
+void startRecording() {
+    if (isBusy || isRecording) return;
+    if (WiFi.status() != WL_CONNECTED) {
+        lastReply = "Wi-Fi disconnected";
+        drawChatUI();
+        return;
+    }
+
+    isRecording = true;
+    lastReply = "Recording...";
+    drawChatUI();
+
+    const int seconds = RECORD_SECONDS;
+    const int rate = SAMPLE_RATE;
+    micSamples = rate * seconds;
+    if (micBuffer) { free(micBuffer); micBuffer = nullptr; }
+    micBuffer = (int16_t*)malloc(micSamples * sizeof(int16_t));
+    if (!micBuffer) {
+        isRecording = false;
+        lastReply = "Out of memory";
+        drawChatUI();
+        return;
+    }
+
+    memset(micBuffer, 0, micSamples * sizeof(int16_t));
+    M5.Mic.begin();
+    // Blocking record for the duration
+    M5.Mic.record(micBuffer, micSamples, rate);
+    M5.Mic.end();
+    isRecording = false;
+
+    lastReply = "Transcribing...";
+    isBusy = true;
+    drawChatUI();
+
+    // Build a minimal WAV in memory so /api/stt always gets a valid file
+    // 44-byte header + PCM
+    size_t pcmBytes = micSamples * 2;
+    size_t wavLen = 44 + pcmBytes;
+    uint8_t* wav = (uint8_t*)malloc(wavLen);
+    if (!wav) {
+        free(micBuffer); micBuffer = nullptr;
+        isBusy = false;
+        lastReply = "Out of memory";
+        drawChatUI();
+        return;
+    }
+    // RIFF header
+    memcpy(wav + 0, "RIFF", 4);
+    uint32_t chunkSize = 36 + pcmBytes;
+    memcpy(wav + 4, &chunkSize, 4);
+    memcpy(wav + 8, "WAVE", 4);
+    memcpy(wav + 12, "fmt ", 4);
+    uint32_t sub1 = 16; memcpy(wav + 16, &sub1, 4);
+    uint16_t fmt = 1; memcpy(wav + 20, &fmt, 2);          // PCM
+    uint16_t ch = 1; memcpy(wav + 22, &ch, 2);
+    uint32_t sr = rate; memcpy(wav + 24, &sr, 4);
+    uint32_t br = rate * 2; memcpy(wav + 28, &br, 4);
+    uint16_t ba = 2; memcpy(wav + 32, &ba, 2);
+    uint16_t bps = 16; memcpy(wav + 34, &bps, 2);
+    memcpy(wav + 36, "data", 4);
+    uint32_t dataSz = pcmBytes; memcpy(wav + 40, &dataSz, 4);
+    memcpy(wav + 44, micBuffer, pcmBytes);
+
+    free(micBuffer);
+    micBuffer = nullptr;
+    micSamples = 0;
+
+    // POST binary WAV to /api/stt
+    WiFiClient client;
+    HTTPClient http;
+    http.setConnectTimeout(8000);
+    http.setTimeout(60000);
+    http.setReuse(false);
+    http.useHTTP10(true);
+
+    String url = serverBase + "/api/stt?sample_rate=" + String(rate);
+    if (!http.begin(client, url)) {
+        free(wav);
+        isBusy = false;
+        lastReply = "Bad STT URL";
+        drawChatUI();
+        return;
+    }
+    http.addHeader("Content-Type", "audio/wav");
+    http.addHeader("Content-Length", String(wavLen));
+
+    int code = http.POST(wav, wavLen);
+    free(wav);
+
+    String transcript = "";
+    if (code == 200) {
+        String resp = http.getString();
+        JsonDocument doc;
+        if (!deserializeJson(doc, resp) && doc["text"].is<const char*>()) {
+            transcript = doc["text"].as<String>();
+        } else if (doc["error"].is<const char*>()) {
+            lastReply = doc["error"].as<String>();
+            http.end();
+            isBusy = false;
+            drawChatUI();
+            return;
+        } else {
+            lastReply = "STT bad JSON";
+            http.end();
+            isBusy = false;
+            drawChatUI();
+            return;
+        }
+    } else {
+        lastReply = http.errorToString(code);
+        http.end();
+        isBusy = false;
+        drawChatUI();
+        return;
+    }
+    http.end();
+
+    if (transcript.length() == 0) {
+        isBusy = false;
+        lastReply = "Empty transcript";
+        drawChatUI();
+        return;
+    }
+
+    // Show what was heard, then send to chat
+    lastReply = String("Heard: ") + transcript;
+    drawChatUI();
+    delay(400);
+    isBusy = false;
+    sendChat(transcript);
+}
+
+void saveImageToSD() {
+    if (!currentImageBuffer || !SD.begin(4)) return;
+    if (!SD.exists("/images")) SD.mkdir("/images");
+    if (!SD.exists("/images/comfy")) SD.mkdir("/images/comfy");
+    String fn = "/images/comfy/img_" + String(millis()) + ".raw";
+    File f = SD.open(fn.c_str(), FILE_WRITE);
+    if (f) {
+        f.write(currentImageBuffer, 320 * 240 * 2);
+        f.close();
+        lastReply = "Saved " + fn;
+    }
+}
+
+// ---------- setup / loop ----------
 void setup() {
     auto cfg = M5.config();
+    cfg.internal_mic = true;
     M5.begin(cfg);
+    M5.Display.setBrightness(80);
     loadSettings();
-    Serial.printf("[CONFIG] Server URL: %s\n", serverUrl.c_str());
     connectWiFi();
     drawChatUI();
 }
@@ -504,114 +709,112 @@ void setup() {
 void loop() {
     M5.update();
 
-    if (M5.Touch.getCount() > 0) {
-        auto touch = M5.Touch.getDetail(0);
-        int x = touch.x;
-        int y = touch.y;
-
-        if (y >= 240) {
-            if (x >= 214) { 
-                if (touch.wasPressed()) {
-                    modelMode = (modelMode == "realistic") ? "anime" : "realistic";
-                    if (currentState == STATE_CHAT) drawChatUI();
-                }
-            } 
-            else if (x >= 107 && x <= 213) { 
-                if (touch.wasPressed()) {
-                    buttonBPressTime = millis();
-                    buttonBHeld = false;
-                }
-                if (touch.isPressed() && !buttonBHeld && (millis() - buttonBPressTime > 800)) {
-                    activeLoraIdx = -1; 
-                    buttonBHeld = true;
-                    if (currentState == STATE_CHAT) drawChatUI();
-                } 
-                else if (touch.wasReleased() && !buttonBHeld) {
-                    if (!loraNames.empty()) {
-                        activeLoraIdx++;
-                        if (activeLoraIdx >= (int)loraNames.size()) {
-                            activeLoraIdx = -1; 
-                        }
-                    }
-                    if (currentState == STATE_CHAT) drawChatUI();
-                }
-            }
+    if (M5.BtnA.wasPressed()) {
+        if (currentState == STATE_CHAT) {
+            activeEditingField = nullptr;
+            keyboardTitle = "Image Prompt";
+            keyboardBuffer = "";
+            kbMode = MODE_LOWER;
+            shiftHeld = false;
+            currentState = STATE_KEYBOARD;
+            drawKeyboardUI();
+        } else if (currentState == STATE_PICTURE ||
+                   (currentState == STATE_KEYBOARD && keyboardTitle == "Image Prompt")) {
+            currentState = STATE_CHAT;
+            drawChatUI();
         }
     }
 
-    if (currentState == STATE_PICTURE) {
-        if (M5.Touch.getCount() > 0) {
-            auto touch = M5.Touch.getDetail(0);
-            if (touch.wasPressed() && touch.y < 240) touchStartX = touch.x;
-            if (touch.wasReleased()) {
-                touchEndX = touch.x;
-                int diff = touchEndX - touchStartX;
-                if (diff < -50) { 
+    if (M5.BtnB.wasPressed()) {
+        btnBPressStart = millis();
+        btnBLongDone = false;
+    }
+    if (M5.BtnB.isPressed() && !btnBLongDone && millis() - btnBPressStart > 800) {
+        btnBLongDone = true;
+        clearLora();
+    }
+    if (M5.BtnB.wasReleased() && !btnBLongDone) cycleLora();
+
+    if (M5.Touch.getCount() > 0) {
+        auto t = M5.Touch.getDetail(0);
+        int x = t.x, y = t.y;
+        if (y >= 240) return;
+
+        if (currentState == STATE_PICTURE) {
+            if (t.wasPressed()) touchStartX = x;
+            if (t.wasReleased()) {
+                int d = x - touchStartX;
+                if (d < -40) {
                     if (currentImageBuffer) { free(currentImageBuffer); currentImageBuffer = nullptr; }
+                    lastReply = "Discarded";
                     currentState = STATE_CHAT;
                     drawChatUI();
-                } else if (diff > 50) { 
+                } else if (d > 40) {
                     saveImageToSD();
                     if (currentImageBuffer) { free(currentImageBuffer); currentImageBuffer = nullptr; }
                     currentState = STATE_CHAT;
                     drawChatUI();
                 }
             }
+            return;
         }
-        return;
-    }
 
-    if (M5.Touch.getCount() > 0) {
-        auto touch = M5.Touch.getDetail(0);
-        if (touch.wasPressed()) {
-            int x = touch.x;
-            int y = touch.y;
-            if (y >= 240) return; 
+        if (!t.wasPressed()) return;
 
-            if (currentState == STATE_CHAT) {
-                if (x >= 270 && x <= 310 && y >= 5 && y <= 30) {
-                    currentState = STATE_SETTINGS;
-                    drawSettingsUI();
-                } else if (x >= 10 && x <= 150 && y >= 205 && y <= 240) {
-                    sendPayloadToServer("Hello from MantisKAI Core2!");
-                }
-            } 
-            else if (currentState == STATE_SETTINGS) {
-                if (y >= 60 && y <= 85) {
-                    activeEditingField = &wifiSsid;
-                    keyboardTitle = "Wi-Fi SSID";
-                    keyboardBuffer = wifiSsid;
-                    kbMode = MODE_LOWER;
-                    currentState = STATE_KEYBOARD;
-                    drawKeyboardUI();
-                } else if (y >= 110 && y <= 135) {
-                    activeEditingField = &wifiPassword;
-                    keyboardTitle = "Wi-Fi Password";
-                    keyboardBuffer = wifiPassword;
-                    kbMode = MODE_LOWER;
-                    currentState = STATE_KEYBOARD;
-                    drawKeyboardUI();
-                } else if (y >= 160 && y <= 185) {
-                    activeEditingField = &serverUrl;
-                    keyboardTitle = "PC Server URL";
-                    keyboardBuffer = serverUrl;
-                    kbMode = MODE_SYMS;
-                    currentState = STATE_KEYBOARD;
-                    drawKeyboardUI();
-                } else if (x >= 10 && x <= 155 && y >= 200 && y <= 235) {
+        if (currentState == STATE_CHAT) {
+            if (x > 250 && y < 32) {
+                currentState = STATE_SETTINGS;
+                drawSettingsUI();
+            } else if (x < 160 && y > 185) {
+                activeEditingField = nullptr;
+                keyboardTitle = "Message";
+                keyboardBuffer = "";
+                kbMode = MODE_LOWER;
+                shiftHeld = false;
+                currentState = STATE_KEYBOARD;
+                drawKeyboardUI();
+            } else if (x >= 160 && y > 185) {
+                startRecording();
+            } else if (y > 155 && y < 185) {
+                modelMode = modelMode == "realistic" ? "anime" : "realistic";
+                drawChatUI();
+            }
+        } else if (currentState == STATE_SETTINGS) {
+            if (y > 56 && y < 90) {
+                activeEditingField = &wifiSsid;
+                keyboardTitle = "Wi-Fi SSID";
+                keyboardBuffer = wifiSsid;
+                kbMode = MODE_LOWER;
+                currentState = STATE_KEYBOARD;
+                drawKeyboardUI();
+            } else if (y > 106 && y < 140) {
+                activeEditingField = &wifiPassword;
+                keyboardTitle = "Wi-Fi Password";
+                keyboardBuffer = wifiPassword;
+                kbMode = MODE_LOWER;
+                currentState = STATE_KEYBOARD;
+                drawKeyboardUI();
+            } else if (y > 156 && y < 190) {
+                activeEditingField = &serverBase;
+                keyboardTitle = "Server Base URL";
+                keyboardBuffer = serverBase;
+                kbMode = MODE_SYMBOLS;
+                currentState = STATE_KEYBOARD;
+                drawKeyboardUI();
+            } else if (y > 200) {
+                if (x < 160) {
                     currentState = STATE_CHAT;
                     drawChatUI();
-                } else if (x >= 165 && x <= 310 && y >= 200 && y <= 235) {
+                } else {
                     saveSettings();
                     connectWiFi();
                     currentState = STATE_CHAT;
                     drawChatUI();
                 }
             }
-            else if (currentState == STATE_KEYBOARD) {
-                handleKeyboardTouch(x, y);
-            }
+        } else if (currentState == STATE_KEYBOARD) {
+            handleKeyboardTouch(x, y);
         }
     }
-    delay(100);
+    delay(20);
 }
