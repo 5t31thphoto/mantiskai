@@ -2,15 +2,23 @@
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
-#include <base64.h>
+#include <mbedtls/base64.h>
 #include <Preferences.h>
 
 Preferences preferences;
 
-// --- CONFIGURATION & STORAGE ---
-String wifiSsid = "YOUR_WIFI_SSID";
-String wifiPassword = "YOUR_WIFI_PASSWORD";
-String serverUrl = "http://192.168.1.157:5000/api/chat";
+// ==========================================
+// CONFIGURATION & EDITABLE SETTINGS
+// ==========================================
+const char* WIFI_SSID = "YOUR_WIFI_SSID";
+const char* WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
+const char* PYTHON_SERVER_URL = "http://192.168.1.157:5000/api/chat"; // Update with your PC's IP
+// ==========================================
+
+// Runtime working strings (loaded from preferences or fallbacks above)
+String wifiSsid = WIFI_SSID;
+String wifiPassword = WIFI_PASSWORD;
+String serverUrl = PYTHON_SERVER_URL;
 
 // Color Palette (#007373, #5d005d, #00ff00)
 #define COLOR_BG          0x0841  
@@ -40,9 +48,9 @@ size_t bufferSize = 0;
 
 void loadSettings() {
     preferences.begin("mantiskai", true);
-    wifiSsid = preferences.getString("ssid", wifiSsid);
-    wifiPassword = preferences.getString("pass", wifiPassword);
-    serverUrl = preferences.getString("server", serverUrl);
+    wifiSsid = preferences.getString("ssid", WIFI_SSID);
+    wifiPassword = preferences.getString("pass", WIFI_PASSWORD);
+    serverUrl = preferences.getString("server", PYTHON_SERVER_URL);
     preferences.end();
 }
 
@@ -264,13 +272,18 @@ void sendPayloadToServer(String message, String audioBase64 = "") {
         String responseAudio = responseDoc["audio_base64"].as<String>();
 
         if (responseAudio.length() > 0) {
-            int decodedLen = base64::decodedLength(responseAudio.c_str());
-            uint8_t* audioBytes = (uint8_t*)malloc(decodedLen);
-            int len = base64::decode(responseAudio.c_str(), audioBytes, decodedLen);
+            size_t decodedLen = 0;
+            // First pass to get decoded length using mbedtls
+            mbedtls_base64_decode(NULL, 0, &decodedLen, (const unsigned char*)responseAudio.c_str(), responseAudio.length());
             
-            if (len > 0) {
-                M5.Speaker.begin();
-                M5.Speaker.playRaw(audioBytes, len, 22050, false, 1, 0);
+            if (decodedLen > 0) {
+                unsigned char* audioBytes = (unsigned char*)malloc(decodedLen);
+                size_t actualLen = 0;
+                if (mbedtls_base64_decode(audioBytes, decodedLen, &actualLen, (const unsigned char*)responseAudio.c_str(), responseAudio.length()) == 0) {
+                    M5.Speaker.begin();
+                    M5.Speaker.playRaw((const uint8_t*)audioBytes, actualLen, 22050, false, 1, 0);
+                }
+                free(audioBytes);
             }
         }
     } else {
@@ -303,14 +316,28 @@ void recordAndSendVoice() {
     drawChatUI();
 
     if (micBuffer) {
-        String audioB64 = base64::encode((uint8_t*)micBuffer, bufferSize * sizeof(int16_t));
+        // Encode mic PCM buffer using mbedtls base64
+        size_t b64Len = 0;
+        mbedtls_base64_encode(NULL, 0, &b64Len, (const unsigned char*)micBuffer, bufferSize * sizeof(int16_t));
+        
+        char* b64Output = (char*)malloc(b64Len + 1);
+        size_t actualB64Len = 0;
+        if (mbedtls_base64_encode((unsigned char*)b64Output, b64Len, &actualB64Len, (const unsigned char*)micBuffer, bufferSize * sizeof(int16_t)) == 0) {
+            b64Output[actualB64Len] = '\0';
+            String audioB64 = String(b64Output);
+            free(b64Output);
+            free(micBuffer);
+            micBuffer = nullptr;
+            
+            sendPayloadToServer("", audioB64);
+            return;
+        }
+        free(b64Output);
         free(micBuffer);
         micBuffer = nullptr;
-        sendPayloadToServer("", audioB64);
-    } else {
-        lastReply = "Mic buffer allocation failed";
-        drawChatUI();
     }
+    lastReply = "Mic buffer failed";
+    drawChatUI();
 }
 
 void setup() {
