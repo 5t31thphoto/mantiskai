@@ -13,8 +13,8 @@ Preferences preferences;
 // ==========================================
 // CONFIGURATION & EDITABLE SETTINGS
 // ==========================================
-const char* WIFI_SSID = "YOUR_WIFI_SSID";
-const char* WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
+const char* WIFI_SSID = "DEFAULT_SSID";
+const char* WIFI_PASSWORD = "DEFAULT_PASSWORD";
 const char* PYTHON_SERVER_URL = "http://192.168.1.157:5000/api/chat"; 
 // ==========================================
 
@@ -65,9 +65,26 @@ int touchStartX = 0;
 int touchEndX = 0;
 
 void loadSettings() {
+    // 1. Try loading from SD Card config file first (so credentials stay out of git)
+    if (SD.begin(4)) {
+        if (SD.exists("/wifi_config.json")) {
+            File file = SD.open("/wifi_config.json", FILE_READ);
+            if (file) {
+                StaticJsonDocument<512> doc;
+                DeserializationError error = deserializeJson(doc, file);
+                if (!error) {
+                    if (doc.containsKey("ssid")) wifiSsid = doc["ssid"].as<String>();
+                    if (doc.containsKey("pass")) wifiPassword = doc["pass"].as<String>();
+                }
+                file.close();
+            }
+        }
+    }
+
+    // 2. Fallback to NVS Preferences if overrides exist
     preferences.begin("mantiskai", true);
-    wifiSsid = preferences.getString("ssid", WIFI_SSID);
-    wifiPassword = preferences.getString("pass", WIFI_PASSWORD);
+    wifiSsid = preferences.getString("ssid", wifiSsid);
+    wifiPassword = preferences.getString("pass", wifiPassword);
     serverUrl = preferences.getString("server", PYTHON_SERVER_URL);
     preferences.end();
 }
@@ -207,84 +224,148 @@ void drawKeyboardUI() {
     M5.Display.setCursor(15, 42);
     M5.Display.print(keyboardBuffer);
 
-    String r0, r1, r2, r3;
-    if (kbMode == MODE_LOWER) {
-        r0 = "1234567890";
-        r1 = "qwertyuiop";
-        r2 = "asdfghjkl;";
-        r3 = "UP symzxcvbnm<OK";
-    } else if (kbMode == MODE_UPPER) {
-        r0 = "!@#$%^&*()";
-        r1 = "QWERTYUIOP";
-        r2 = "ASDFGHJKL:";
-        r3 = "lo symZXCVBNM<OK";
-    } else {
-        r0 = "1234567890";
-        r1 = "!@#$%^&*()";
-        r2 = "-_+=;:/?.,$";
-        r3 = "abc ABC[]{}|<OK";
+    String r0 = "1234567890";
+    String r1 = (kbMode == MODE_UPPER) ? "QWERTYUIOP" : "qwertyuiop";
+    String r2 = (kbMode == MODE_UPPER) ? "ASDFGHJKL:" : "asdfghjkl;";
+    String r3 = (kbMode == MODE_SYMS) ? "-_+=;:/?.,$" : ((kbMode == MODE_UPPER) ? "ZXCVBNM" : "zxcvbnm");
+
+    // Row 0: Numbers
+    int len0 = r0.length();
+    int btnW0 = 300 / len0;
+    for (int c = 0; c < len0; c++) {
+        int x = 10 + (c * btnW0);
+        int y = 75;
+        M5.Display.fillRect(x + 1, y + 1, btnW0 - 2, 32, 0x2a2a);
+        M5.Display.drawRect(x, y, btnW0, 34, COLOR_PURPLE);
+        M5.Display.setTextColor(COLOR_WHITE, 0x2a2a);
+        M5.Display.setTextSize(1);
+        M5.Display.setCursor(x + 4, y + 10);
+        M5.Display.print(r0[c]);
     }
 
-    String rows[4] = {r0, r1, r2, r3};
-    int startY = 75;
-    for (int r = 0; r < 4; r++) {
-        String rowStr = rows[r];
-        int len = rowStr.length();
-        int btnW = 300 / len;
-        for (int c = 0; c < len; c++) {
-            int x = 10 + (c * btnW);
-            int y = startY + (r * 35);
-            M5.Display.fillRect(x + 1, y + 1, btnW - 2, 32, 0x2a2a);
-            M5.Display.drawRect(x, y, btnW, 34, COLOR_PURPLE);
-            M5.Display.setTextColor(COLOR_WHITE, 0x2a2a);
-            M5.Display.setTextSize(1);
-            M5.Display.setCursor(x + 3, y + 10);
-            M5.Display.print(rowStr[c]);
-        }
+    // Row 1: QWERTY
+    int len1 = r1.length();
+    int btnW1 = 300 / len1;
+    for (int c = 0; c < len1; c++) {
+        int x = 10 + (c * btnW1);
+        int y = 110;
+        M5.Display.fillRect(x + 1, y + 1, btnW1 - 2, 32, 0x2a2a);
+        M5.Display.drawRect(x, y, btnW1, 34, COLOR_PURPLE);
+        M5.Display.setTextColor(COLOR_WHITE, 0x2a2a);
+        M5.Display.setTextSize(1);
+        M5.Display.setCursor(x + 4, y + 10);
+        M5.Display.print(r1[c]);
+    }
+
+    // Row 2: ASDFGH
+    int len2 = r2.length();
+    int btnW2 = 300 / len2;
+    for (int c = 0; c < len2; c++) {
+        int x = 10 + (c * btnW2);
+        int y = 145;
+        M5.Display.fillRect(x + 1, y + 1, btnW2 - 2, 32, 0x2a2a);
+        M5.Display.drawRect(x, y, btnW2, 34, COLOR_PURPLE);
+        M5.Display.setTextColor(COLOR_WHITE, 0x2a2a);
+        M5.Display.setTextSize(1);
+        M5.Display.setCursor(x + 4, y + 10);
+        M5.Display.print(r2[c]);
+    }
+
+    // Row 3: Special controls (Shift, Sym, Backspace, OK)
+    const char* labels[4] = {
+        (kbMode == MODE_UPPER) ? "abc" : "ABC", 
+        (kbMode == MODE_SYMS) ? "abc" : "SYM", 
+        "<-", 
+        "OK"
+    };
+    int bWidth = 300 / 4;
+    for (int i = 0; i < 4; i++) {
+        int x = 10 + (i * bWidth);
+        int y = 180;
+        uint16_t btnColor = (i == 3) ? COLOR_GREEN : ((i == 2) ? COLOR_RED : 0x2a2a);
+        M5.Display.fillRect(x + 1, y + 1, bWidth - 2, 35, btnColor);
+        M5.Display.drawRect(x, y, bWidth, 37, COLOR_PURPLE);
+        M5.Display.setTextColor((i == 3) ? 0x0000 : COLOR_WHITE, btnColor);
+        M5.Display.setTextSize(1);
+        M5.Display.setCursor(x + (bWidth / 2) - 10, y + 12);
+        M5.Display.print(labels[i]);
+    }
+
+    // Row 4: ZXCVBNM letter keys
+    int len4 = r3.length();
+    int btnW4 = 300 / len4;
+    for (int c = 0; c < len4; c++) {
+        int x = 10 + (c * btnW4);
+        int y = 220;
+        M5.Display.fillRect(x + 1, y + 1, btnW4 - 2, 28, 0x2a2a);
+        M5.Display.drawRect(x, y, btnW4, 30, COLOR_PURPLE);
+        M5.Display.setTextColor(COLOR_WHITE, 0x2a2a);
+        M5.Display.setTextSize(1);
+        M5.Display.setCursor(x + 4, y + 8);
+        M5.Display.print(r3[c]);
     }
 }
 
 void handleKeyboardTouch(int touchX, int touchY) {
-    String r0, r1, r2, r3;
-    if (kbMode == MODE_LOWER) {
-        r0 = "1234567890";
-        r1 = "qwertyuiop";
-        r2 = "asdfghjkl;";
-        r3 = "UP symzxcvbnm<OK";
-    } else if (kbMode == MODE_UPPER) {
-        r0 = "!@#$%^&*()";
-        r1 = "QWERTYUIOP";
-        r2 = "ASDFGHJKL:";
-        r3 = "lo symZXCVBNM<OK";
-    } else {
-        r0 = "1234567890";
-        r1 = "!@#$%^&*()";
-        r2 = "-_+=;:/?.,$";
-        r3 = "abc ABC[]{}|<OK";
-    }
-
-    String rows[4] = {r0, r1, r2, r3};
-    int startY = 75;
-
-    for (int r = 0; r < 4; r++) {
-        String rowStr = rows[r];
-        int len = rowStr.length();
-        int btnW = 300 / len;
-        for (int c = 0; c < len; c++) {
-            int x = 10 + (c * btnW);
-            int y = startY + (r * 35);
-
-            if (touchX >= x && touchX <= x + btnW && touchY >= y && touchY <= y + 34) {
-                char ch = rowStr[c];
-                if (ch == '<') {
-                    if (keyboardBuffer.length() > 0) keyboardBuffer.remove(keyboardBuffer.length() - 1);
-                } else {
-                    keyboardBuffer += ch;
-                }
-                drawKeyboardUI();
-                return;
-            }
+    if (touchY >= 75 && touchY <= 109) {
+        String r0 = "1234567890";
+        int btnW = 300 / r0.length();
+        int idx = (touchX - 10) / btnW;
+        if (idx >= 0 && idx < (int)r0.length()) {
+            keyboardBuffer += r0[idx];
+            drawKeyboardUI();
         }
+        return;
+    }
+    if (touchY >= 110 && touchY <= 144) {
+        String r1 = (kbMode == MODE_UPPER) ? "QWERTYUIOP" : "qwertyuiop";
+        int btnW = 300 / r1.length();
+        int idx = (touchX - 10) / btnW;
+        if (idx >= 0 && idx < (int)r1.length()) {
+            keyboardBuffer += r1[idx];
+            drawKeyboardUI();
+        }
+        return;
+    }
+    if (touchY >= 145 && touchY <= 179) {
+        String r2 = (kbMode == MODE_UPPER) ? "ASDFGHJKL:" : "asdfghjkl;";
+        int btnW = 300 / r2.length();
+        int idx = (touchX - 10) / btnW;
+        if (idx >= 0 && idx < (int)r2.length()) {
+            keyboardBuffer += r2[idx];
+            drawKeyboardUI();
+        }
+        return;
+    }
+    if (touchY >= 180 && touchY <= 216) {
+        int bWidth = 300 / 4;
+        int idx = (touchX - 10) / bWidth;
+        if (idx == 0) { 
+            if (kbMode == MODE_UPPER) kbMode = MODE_LOWER;
+            else kbMode = MODE_UPPER;
+        } else if (idx == 1) { 
+            if (kbMode == MODE_SYMS) kbMode = MODE_LOWER;
+            else kbMode = MODE_SYMS;
+        } else if (idx == 2) { 
+            if (keyboardBuffer.length() > 0) keyboardBuffer.remove(keyboardBuffer.length() - 1);
+        } else if (idx == 3) { 
+            if (activeEditingField) *activeEditingField = keyboardBuffer;
+            currentState = STATE_SETTINGS;
+            drawSettingsUI();
+            return;
+        }
+        drawKeyboardUI();
+        return;
+    }
+    if (touchY >= 217 && touchY <= 247) {
+        String r3 = (kbMode == MODE_SYMS) ? "-_+=;:/?.,$" : ((kbMode == MODE_UPPER) ? "ZXCVBNM" : "zxcvbnm");
+        int btnW = 300 / r3.length();
+        int idx = (touchX - 10) / btnW;
+        if (idx >= 0 && idx < (int)r3.length()) {
+            keyboardBuffer += r3[idx];
+            drawKeyboardUI();
+        }
+        return;
     }
 }
 
@@ -371,7 +452,6 @@ void setup() {
 void loop() {
     M5.update();
 
-    // Bottom Bezel Button Zones Handling (BtnA: 0-106, BtnB: 107-213, BtnC: 214-320)
     if (M5.Touch.getCount() > 0) {
         auto touch = M5.Touch.getDetail(0);
         int x = touch.x;
@@ -379,20 +459,18 @@ void loop() {
 
         if (y >= 240) {
             if (x >= 214) { 
-                // Button C: Toggle Model Mode (Realistic <-> Anime)
                 if (touch.wasPressed()) {
                     modelMode = (modelMode == "realistic") ? "anime" : "realistic";
                     if (currentState == STATE_CHAT) drawChatUI();
                 }
             } 
             else if (x >= 107 && x <= 213) { 
-                // Button B: Cycle LoRA (Short press) / Clear LoRA (Long press > 800ms)
                 if (touch.wasPressed()) {
                     buttonBPressTime = millis();
                     buttonBHeld = false;
                 }
                 if (touch.isPressed() && !buttonBHeld && (millis() - buttonBPressTime > 800)) {
-                    activeLoraIdx = -1; // Clear LoRA
+                    activeLoraIdx = -1; 
                     buttonBHeld = true;
                     if (currentState == STATE_CHAT) drawChatUI();
                 } 
@@ -400,7 +478,7 @@ void loop() {
                     if (!loraNames.empty()) {
                         activeLoraIdx++;
                         if (activeLoraIdx >= (int)loraNames.size()) {
-                            activeLoraIdx = -1; // Wrap around to none
+                            activeLoraIdx = -1; 
                         }
                     }
                     if (currentState == STATE_CHAT) drawChatUI();
@@ -416,11 +494,11 @@ void loop() {
             if (touch.wasReleased()) {
                 touchEndX = touch.x;
                 int diff = touchEndX - touchStartX;
-                if (diff < -50) { // Swipe Left -> Delete
+                if (diff < -50) { 
                     if (currentImageBuffer) { free(currentImageBuffer); currentImageBuffer = nullptr; }
                     currentState = STATE_CHAT;
                     drawChatUI();
-                } else if (diff > 50) { // Swipe Right -> Save
+                } else if (diff > 50) { 
                     saveImageToSD();
                     if (currentImageBuffer) { free(currentImageBuffer); currentImageBuffer = nullptr; }
                     currentState = STATE_CHAT;
@@ -436,7 +514,7 @@ void loop() {
         if (touch.wasPressed()) {
             int x = touch.x;
             int y = touch.y;
-            if (y >= 240) return; // handled by bezel logic
+            if (y >= 240) return; 
 
             if (currentState == STATE_CHAT) {
                 if (x >= 270 && x <= 310 && y >= 5 && y <= 30) {
