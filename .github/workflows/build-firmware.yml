@@ -49,9 +49,9 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install PlatformIO
+      - name: Install PlatformIO and esptool
         run: |
-          pip install -U platformio
+          pip install -U platformio esptool
           pio --version
 
       - name: Build firmware (m5stack-core2)
@@ -84,6 +84,13 @@ jobs:
             }]
           }
           MAN
+
+      - name: Create merged binary
+        run: |
+          python -m esptool --chip esp32 merge_bin -o dist/merged-firmware.bin \
+            0x1000 dist/bootloader.bin \
+            0x8000 dist/partition-table.bin \
+            0x10000 dist/mantiskai-core2.bin
           ls -la dist/
 
       - name: Upload firmware artifact
