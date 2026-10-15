@@ -1,0 +1,33 @@
+- name: Package dist for web flasher
+        run: |
+          set -e
+          mkdir -p dist
+          BUILD=.pio/build/m5stack-core2
+          cp "$BUILD/bootloader.bin"        dist/bootloader.bin
+          cp "$BUILD/partitions.bin"        dist/partition-table.bin
+          APP=$(ls "$BUILD"/firmware.bin "$BUILD"/m5stack-core2.bin 2>/dev/null | head -1)
+          test -n "$APP"
+          cp "$APP" dist/mantiskai-core2.bin
+          cat > dist/manifest.json << MAN
+          {
+            "name": "MantisKAI Core2",
+            "version": "1.0.0",
+            "new_install_prompt_erase": true,
+            "builds": [{
+              "chipFamily": "ESP32",
+              "parts": [
+                { "path": "bootloader.bin", "offset": 4096 },
+                { "path": "partition-table.bin", "offset": 32768 },
+                { "path": "mantiskai-core2.bin", "offset": 65536 }
+              ]
+            }]
+          }
+          MAN
+
+      - name: Create merged binary
+        run: |
+          python -m esptool --chip esp32 merge_bin -o dist/merged-firmware.bin \
+            0x1000 dist/bootloader.bin \
+            0x8000 dist/partition-table.bin \
+            0x10000 dist/mantiskai-core2.bin
+          ls -la dist/
