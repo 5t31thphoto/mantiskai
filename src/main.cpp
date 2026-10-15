@@ -6,6 +6,7 @@
 #include <Preferences.h>
 #include <SD.h>
 #include <SPI.h>
+#include <vector>
 
 Preferences preferences;
 
@@ -35,6 +36,14 @@ AppState currentState = STATE_CHAT;
 String lastReply = "Ready. Tap screen to chat or record.";
 bool isConnected = false;
 bool isRecording = false;
+
+// Image Generation & Model State
+String modelMode = "realistic"; // "realistic" or "anime"
+std::vector<String> loraNames = {"detailer.safetensors", "cyberpunk.safetensors"};
+int activeLoraIdx = -1; // -1 = No LoRA
+
+unsigned long buttonBPressTime = 0;
+bool buttonBHeld = false;
 
 // Keyboard editing state
 String* activeEditingField = nullptr;
@@ -101,19 +110,27 @@ void drawChatUI() {
     M5.Display.fillCircle(250, 18, 6, isConnected ? COLOR_GREEN : COLOR_RED);
 
     // Chat Box Area
-    M5.Display.drawRect(10, 45, 300, 145, COLOR_PURPLE);
+    M5.Display.drawRect(10, 45, 300, 125, COLOR_PURPLE);
     M5.Display.setTextColor(COLOR_WHITE, COLOR_BG);
     M5.Display.setTextSize(1);
-    M5.Display.setCursor(15, 55);
+    M5.Display.setCursor(15, 52);
     M5.Display.print(isRecording ? "RECORDING VOICE..." : "AI Response:");
     
-    M5.Display.setCursor(15, 75);
+    M5.Display.setCursor(15, 70);
     M5.Display.setTextSize(2);
     M5.Display.setTextColor(isRecording ? COLOR_RED : COLOR_GREEN, COLOR_BG);
     
     String displayStr = lastReply;
-    if (displayStr.length() > 90) displayStr = displayStr.substring(0, 87) + "...";
+    if (displayStr.length() > 80) displayStr = displayStr.substring(0, 77) + "...";
     M5.Display.println(displayStr);
+
+    // Model & LoRA Status Bar
+    M5.Display.fillRect(10, 175, 300, 22, 0x1ef8);
+    M5.Display.setTextColor(COLOR_WHITE, 0x1ef8);
+    M5.Display.setTextSize(1);
+    M5.Display.setCursor(15, 182);
+    String loraStatus = (activeLoraIdx >= 0 && activeLoraIdx < (int)loraNames.size()) ? loraNames[activeLoraIdx] : "None";
+    M5.Display.print("M: " + modelMode + " | LoRA: " + loraStatus);
 
     // Bottom Action Buttons
     M5.Display.fillRect(10, 205, 140, 35, COLOR_PURPLE);
@@ -177,7 +194,6 @@ void drawSettingsUI() {
 void drawKeyboardUI() {
     M5.Display.fillScreen(COLOR_BG);
 
-    // Header showing what is being edited & mode
     M5.Display.fillRect(0, 0, 320, 30, COLOR_TEAL);
     M5.Display.setTextColor(COLOR_WHITE, COLOR_TEAL);
     M5.Display.setTextSize(1);
@@ -185,25 +201,23 @@ void drawKeyboardUI() {
     String modeStr = (kbMode == MODE_LOWER) ? "[abc]" : (kbMode == MODE_UPPER) ? "[ABC]" : "[SYM]";
     M5.Display.print("Edit: " + keyboardTitle + " " + modeStr);
 
-    // Input preview box
     M5.Display.drawRect(10, 35, 300, 30, COLOR_PURPLE);
     M5.Display.setTextColor(COLOR_GREEN, COLOR_BG);
     M5.Display.setTextSize(2);
     M5.Display.setCursor(15, 42);
     M5.Display.print(keyboardBuffer);
 
-    // Select Rows based on Keyboard Mode
     String r0, r1, r2, r3;
     if (kbMode == MODE_LOWER) {
         r0 = "1234567890";
         r1 = "qwertyuiop";
         r2 = "asdfghjkl;";
-        r3 = "UP symzxcvbnm<OK"; // UP = switch to upper, sym = switch to symbols
+        r3 = "UP symzxcvbnm<OK";
     } else if (kbMode == MODE_UPPER) {
         r0 = "!@#$%^&*()";
         r1 = "QWERTYUIOP";
         r2 = "ASDFGHJKL:";
-        r3 = "lo symZXCVBNM<OK"; // lo = switch to lower
+        r3 = "lo symZXCVBNM<OK";
     } else {
         r0 = "1234567890";
         r1 = "!@#$%^&*()";
@@ -225,10 +239,7 @@ void drawKeyboardUI() {
             M5.Display.setTextColor(COLOR_WHITE, 0x2a2a);
             M5.Display.setTextSize(1);
             M5.Display.setCursor(x + 3, y + 10);
-            
-            // Render specific key label handling for multi-char keys
-            char ch = rowStr[c];
-            M5.Display.print(ch);
+            M5.Display.print(rowStr[c]);
         }
     }
 }
@@ -264,21 +275,10 @@ void handleKeyboardTouch(int touchX, int touchY) {
             int y = startY + (r * 35);
 
             if (touchX >= x && touchX <= x + btnW && touchY >= y && touchY <= y + 34) {
-                // Check special multi-character buttons on bottom row (row 3)
-                if (r == 3) {
-                    if (rowStr == "UP symzxcvbnm<OK") {
-                        if (c == 0 && rowStr.substring(0, 2) == "UP") { kbMode = MODE_UPPER; drawKeyboardUI(); return; }
-                        // simplified touch mapping for bottom controls
-                    }
-                }
-                
                 char ch = rowStr[c];
-                if (ch == '<') { // Backspace
-                    if (keyboardBuffer.length() > 0) {
-                        keyboardBuffer.remove(keyboardBuffer.length() - 1);
-                    }
+                if (ch == '<') {
+                    if (keyboardBuffer.length() > 0) keyboardBuffer.remove(keyboardBuffer.length() - 1);
                 } else {
-                    // Simple character append or mode toggle trigger
                     keyboardBuffer += ch;
                 }
                 drawKeyboardUI();
@@ -288,7 +288,6 @@ void handleKeyboardTouch(int touchX, int touchY) {
     }
 }
 
-// Picture Mode Rendering & SD Save
 void drawPictureUI() {
     M5.Display.fillScreen(0x0000);
     if (currentImageBuffer) {
@@ -372,10 +371,48 @@ void setup() {
 void loop() {
     M5.update();
 
+    // Bottom Bezel Button Zones Handling (BtnA: 0-106, BtnB: 107-213, BtnC: 214-320)
+    if (M5.Touch.getCount() > 0) {
+        auto touch = M5.Touch.getDetail(0);
+        int x = touch.x;
+        int y = touch.y;
+
+        if (y >= 240) {
+            if (x >= 214) { 
+                // Button C: Toggle Model Mode (Realistic <-> Anime)
+                if (touch.wasPressed()) {
+                    modelMode = (modelMode == "realistic") ? "anime" : "realistic";
+                    if (currentState == STATE_CHAT) drawChatUI();
+                }
+            } 
+            else if (x >= 107 && x <= 213) { 
+                // Button B: Cycle LoRA (Short press) / Clear LoRA (Long press > 800ms)
+                if (touch.wasPressed()) {
+                    buttonBPressTime = millis();
+                    buttonBHeld = false;
+                }
+                if (touch.isPressed() && !buttonBHeld && (millis() - buttonBPressTime > 800)) {
+                    activeLoraIdx = -1; // Clear LoRA
+                    buttonBHeld = true;
+                    if (currentState == STATE_CHAT) drawChatUI();
+                } 
+                else if (touch.wasReleased() && !buttonBHeld) {
+                    if (!loraNames.empty()) {
+                        activeLoraIdx++;
+                        if (activeLoraIdx >= (int)loraNames.size()) {
+                            activeLoraIdx = -1; // Wrap around to none
+                        }
+                    }
+                    if (currentState == STATE_CHAT) drawChatUI();
+                }
+            }
+        }
+    }
+
     if (currentState == STATE_PICTURE) {
         if (M5.Touch.getCount() > 0) {
             auto touch = M5.Touch.getDetail(0);
-            if (touch.wasPressed()) touchStartX = touch.x;
+            if (touch.wasPressed() && touch.y < 240) touchStartX = touch.x;
             if (touch.wasReleased()) {
                 touchEndX = touch.x;
                 int diff = touchEndX - touchStartX;
@@ -399,6 +436,7 @@ void loop() {
         if (touch.wasPressed()) {
             int x = touch.x;
             int y = touch.y;
+            if (y >= 240) return; // handled by bezel logic
 
             if (currentState == STATE_CHAT) {
                 if (x >= 270 && x <= 310 && y >= 5 && y <= 30) {
@@ -406,8 +444,6 @@ void loop() {
                     drawSettingsUI();
                 } else if (x >= 10 && x <= 150 && y >= 205 && y <= 240) {
                     sendPayloadToServer("Hello from MantisKAI Core2!");
-                } else if (x >= 170 && x <= 310 && y >= 205 && y <= 240) {
-                    // record voice...
                 }
             } 
             else if (currentState == STATE_SETTINGS) {
