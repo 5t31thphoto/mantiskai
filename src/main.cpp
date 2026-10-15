@@ -65,7 +65,7 @@ int touchStartX = 0;
 int touchEndX = 0;
 
 void loadSettings() {
-    // 1. Try loading from SD Card config file first (so credentials stay out of git)
+    // 1. Try loading from SD Card config file first
     if (SD.begin(4)) {
         if (SD.exists("/wifi_config.json")) {
             File file = SD.open("/wifi_config.json", FILE_READ);
@@ -81,12 +81,14 @@ void loadSettings() {
         }
     }
 
-    // 2. Fallback to NVS Preferences if overrides exist
+    // 2. Fallback to NVS Preferences for Wi-Fi only, force serverUrl to code constant
     preferences.begin("mantiskai", true);
     wifiSsid = preferences.getString("ssid", wifiSsid);
     wifiPassword = preferences.getString("pass", wifiPassword);
-    serverUrl = preferences.getString("server", PYTHON_SERVER_URL);
     preferences.end();
+
+    // FORCE the server URL to match your hardcoded constant so NVS can't override it with a bad string
+    serverUrl = PYTHON_SERVER_URL;
 }
 
 void saveSettings() {
