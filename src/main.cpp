@@ -438,18 +438,15 @@ void fetchAndPlayTTS(const String& text) {
         return;
     }
 
-    // Sample rate from Piper (header); fallback 22050
     int sampleRate = 22050;
     if (http.hasHeader("X-Sample-Rate")) {
-        sampleRate = http.header("X-Sample-Rate").toInt();
-        if (sampleRate < 8000) sampleRate = 22050;
+        int sr = http.header("X-Sample-Rate").toInt();
+        if (sr >= 8000) sampleRate = sr;
     }
 
-    int len = http.getSize();
-    // if chunked / unknown size, read up to a safe max
-    if (len <= 0) len = 180000;
-
-    uint8_t* buf = (uint8_t*)malloc(len);
+    // Read entire body into a growable buffer (getSize often -1)
+    const int maxBytes = 240000;
+    uint8_t* buf = (uint8_t*)malloc(maxBytes);
     if (!buf) {
         http.end();
         return;
@@ -457,34 +454,44 @@ void fetchAndPlayTTS(const String& text) {
 
     int got = 0;
     WiFiClient* stream = http.getStreamPtr();
-    while (http.connected() && got < len) {
-        size_t avail = stream->available();
-        if (avail) {
-            int n = stream->readBytes(buf + got, min(avail, (size_t)(len - got)));
-            if (n <= 0) break;
-            got += n;
+    unsigned long deadline = millis() + 40000;
+    while (millis() < deadline && got < maxBytes) {
+        int avail = stream->available();
+        if (avail > 0) {
+            int n = stream->readBytes(buf + got, min(avail, maxBytes - got));
+            if (n > 0) got += n;
+            else break;
+        } else if (!http.connected()) {
+            // drain any last bytes
+            delay(5);
+            avail = stream->available();
+            if (avail <= 0) break;
         } else {
-            delay(1);
+            delay(2);
         }
     }
     http.end();
 
-    if (got < 256) {
+    if (got < 512) {
         free(buf);
         return;
     }
 
-    // M5Unified playRaw: len is number of *samples* for int16 data in many builds.
-    // Pass sample count (got/2) for mono PCM16.
     size_t samples = (size_t)got / 2;
-    M5.Speaker.setVolume(200);
-    M5.Speaker.stop();
+
+    M5.Speaker.end();
+    delay(20);
     M5.Speaker.begin();
-    // signature: playRaw(data, length_samples_or_bytes, rate, stereo, repeat, channel)
+    M5.Speaker.setVolume(200);
     M5.Speaker.playRaw((const int16_t*)buf, samples, (uint32_t)sampleRate, false);
 
-    uint32_t ms = (uint32_t)(samples * 1000UL / (uint32_t)sampleRate) + 300;
-    delay(ms);
+    // Wait until speaker finishes (or timeout)
+    unsigned long playMs = (unsigned long)(samples * 1000UL / (unsigned long)sampleRate) + 400;
+    unsigned long start = millis();
+    while (M5.Speaker.isPlaying() && (millis() - start) < playMs) {
+        delay(20);
+        M5.update();
+    }
     M5.Speaker.stop();
     free(buf);
 }
