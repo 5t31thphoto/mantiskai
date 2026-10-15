@@ -411,13 +411,18 @@ void sendPayloadToServer(String message, String audioBase64 = "") {
 
     isConnected = true;
 
+    // FIX: Instantiate an explicit WiFiClient for stable socket handling
+    WiFiClient wifiClient;
     HTTPClient http;
+    
     http.setConnectTimeout(5000);
     http.setTimeout(30000);
+    http.setReuse(false); // Prevent stale keep-alive connection reuse errors
 
-    Serial.printf("[HTTP] POST %s\n", serverUrl.c_str());
+    Serial.printf("[HTTP] Connecting to %s\n", serverUrl.c_str());
 
-    if (!http.begin(serverUrl)) {
+    // FIX: Pass the wifiClient instance explicitly to http.begin()
+    if (!http.begin(wifiClient, serverUrl)) {
         lastReply = "Invalid server URL";
         Serial.println("[HTTP] http.begin() failed");
         drawChatUI();
@@ -433,37 +438,21 @@ void sendPayloadToServer(String message, String audioBase64 = "") {
     String requestBody;
     serializeJson(doc, requestBody);
 
-    Serial.printf("[HTTP] Request bytes: %u\n",
-                  (unsigned)requestBody.length());
-
     int code = http.POST(requestBody);
-
-    Serial.printf("[HTTP] Result: %d (%s)\n",
-                  code,
-                  code < 0 ? http.errorToString(code).c_str() : "HTTP response");
 
     if (code > 0) {
         String body = http.getString();
-
-        Serial.printf("[HTTP] Response bytes: %u\n",
-                      (unsigned)body.length());
-        Serial.printf("[HTTP] Body: %s\n", body.c_str());
-
         JsonDocument responseDoc;
         DeserializationError err = deserializeJson(responseDoc, body);
 
         if (err) {
             lastReply = "Bad JSON response";
-            Serial.printf("[JSON] Parse failed: %s\n", err.c_str());
         } else if (code < 200 || code >= 300) {
             lastReply = responseDoc["error"] | "Server returned HTTP error";
-            Serial.printf("[HTTP] Server error body received\n");
         } else if (responseDoc["reply"].is<const char*>()) {
             lastReply = responseDoc["reply"].as<String>();
 
-            String responseAudio =
-                responseDoc["audio_base64"].as<String>();
-
+            String responseAudio = responseDoc["audio_base64"].as<String>();
             if (responseAudio.length() > 0) {
                 size_t decodedLen = 0;
                 int rc = mbedtls_base64_decode(
@@ -472,9 +461,7 @@ void sendPayloadToServer(String message, String audioBase64 = "") {
                     responseAudio.length());
 
                 if (rc == 0 && decodedLen > 0) {
-                    auto* audioBytes =
-                        (unsigned char*)malloc(decodedLen);
-
+                    auto* audioBytes = (unsigned char*)malloc(decodedLen);
                     if (audioBytes) {
                         size_t actualLen = 0;
                         rc = mbedtls_base64_decode(
@@ -487,23 +474,17 @@ void sendPayloadToServer(String message, String audioBase64 = "") {
                             M5.Speaker.playRaw(
                                 (const uint8_t*)audioBytes,
                                 actualLen, 22050, false, 1, 0);
-                        } else {
-                            Serial.printf("[AUDIO] Decode failed: %d\n", rc);
                         }
                         free(audioBytes);
-                    } else {
-                        Serial.println("[AUDIO] Not enough heap for audio");
                     }
                 }
             }
         } else {
             lastReply = responseDoc["error"] | "Missing reply in JSON";
-            Serial.println("[JSON] Response has no reply field");
         }
     } else {
         lastReply = http.errorToString(code);
-        Serial.printf("[HTTP] Connection/request failed: %s\n",
-                      lastReply.c_str());
+        Serial.printf("[HTTP] Connection failed: %s\n", lastReply.c_str());
     }
 
     http.end();
