@@ -1,33 +1,93 @@
-- name: Package dist for web flasher
-        run: |
-          set -e
-          mkdir -p dist
-          BUILD=.pio/build/m5stack-core2
-          cp "$BUILD/bootloader.bin"        dist/bootloader.bin
-          cp "$BUILD/partitions.bin"        dist/partition-table.bin
-          APP=$(ls "$BUILD"/firmware.bin "$BUILD"/m5stack-core2.bin 2>/dev/null | head -1)
-          test -n "$APP"
-          cp "$APP" dist/mantiskai-core2.bin
-          cat > dist/manifest.json << MAN
-          {
-            "name": "MantisKAI Core2",
-            "version": "1.0.0",
-            "new_install_prompt_erase": true,
-            "builds": [{
-              "chipFamily": "ESP32",
-              "parts": [
-                { "path": "bootloader.bin", "offset": 4096 },
-                { "path": "partition-table.bin", "offset": 32768 },
-                { "path": "mantiskai-core2.bin", "offset": 65536 }
-              ]
-            }]
-          }
-          MAN
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MantisKAI Core2 Web Flasher</title>
+    <style>
+        body {
+            background-color: #121212;
+            color: #ffffff;
+            font-family: Arial, sans-serif;
+            text-align: center;
+            padding-top: 60px;
+            margin: 0;
+        }
+        h1 {
+            color: #00ff00;
+            font-size: 28px;
+            margin-bottom: 10px;
+        }
+        p {
+            color: #cccccc;
+            font-size: 16px;
+            margin-bottom: 25px;
+        }
+        .container {
+            max-width: 500px;
+            margin: 0 auto;
+            padding: 30px;
+            background-color: #1e1e1e;
+            border: 2px solid #5d005d;
+            border-radius: 8px;
+            box-shadow: 0 4px 15px rgba(0, 115, 115, 0.3);
+        }
+        esp-web-install-button {
+            margin-top: 10px;
+            display: block;
+        }
+        button[slot="activate"] {
+            background-color: #007373 !important;
+            color: #ffffff !important;
+            padding: 14px 28px !important;
+            border: none !important;
+            font-size: 16px !important;
+            font-weight: bold !important;
+            cursor: pointer !important;
+            border-radius: 4px !important;
+            transition: background-color 0.2s;
+        }
+        button[slot="activate"]:hover {
+            background-color: #005959 !important;
+        }
+        .download-section {
+            margin-top: 25px;
+            border-top: 1px solid #333333;
+            padding-top: 20px;
+        }
+        .download-btn {
+            color: #00ff00;
+            background-color: transparent;
+            border: 1px dashed #00ff00;
+            padding: 10px 18px;
+            text-decoration: none;
+            font-size: 14px;
+            display: inline-block;
+            border-radius: 4px;
+            transition: background-color 0.2s, color 0.2s;
+        }
+        .download-btn:hover {
+            background-color: rgba(0, 255, 0, 0.1);
+        }
+    </style>
+    <!-- Load ESP Web Tools Web Component -->
+    <script type="module" src="https://unpkg.com/esp-web-tools@10/dist/web/install-button.js?module"></script>
+</head>
+<body>
+    <div class="container">
+        <h1>MantisKAI Core2 Flasher</h1>
+        <p>Connect your M5Stack Core2 via USB to your computer, select the port, and install the latest firmware directly from your browser.</p>
+        
+        <!-- ESP Web Tools Installer Button -->
+        <esp-web-install-button manifest="firmware/manifest.json">
+            <button slot="activate">Install MantisKAI</button>
+        </esp-web-install-button>
 
-      - name: Create merged binary
-        run: |
-          python -m esptool --chip esp32 merge_bin -o dist/merged-firmware.bin \
-            0x1000 dist/bootloader.bin \
-            0x8000 dist/partition-table.bin \
-            0x10000 dist/mantiskai-core2.bin
-          ls -la dist/
+        <!-- Direct Merged Bin Download Section -->
+        <div class="download-section">
+            <p style="font-size: 14px; color: #aaaaaa; margin-bottom: 12px;">Prefer flashing offline with esptool or another utility?</p>
+            <a class="download-btn" href="firmware/merged-firmware.bin" download>Download Merged Binary (.bin)</a>
+        </div>
+    </div>
+</body>
+</html>
