@@ -396,8 +396,8 @@ void fetchAndPlayTTS(const String& text) {
 
     WiFiClient client;
     HTTPClient http;
-    http.setConnectTimeout(5000);
-    http.setTimeout(30000);
+    http.setConnectTimeout(8000);
+    http.setTimeout(45000);
     http.setReuse(false);
     http.useHTTP10(true);
 
@@ -411,22 +411,57 @@ void fetchAndPlayTTS(const String& text) {
     serializeJson(body, bodyStr);
 
     int code = http.POST(bodyStr);
-    if (code == 200) {
-        int len = http.getSize();
-        if (len > 0 && len < 200000) {
-            uint8_t* buf = (uint8_t*)malloc(len);
-            if (buf) {
-                int got = http.getStream().readBytes(buf, len);
-                if (got > 44) {  // minimal WAV header
-                    // skip 44-byte WAV header, play PCM16 mono
-                    M5.Speaker.begin();
-                    M5.Speaker.playRaw(buf + 44, got - 44, 22050, false, 1, 0);
-                }
-                free(buf);
-            }
+    if (code != 200) {
+        http.end();
+        return;
+    }
+
+    // Sample rate from Piper (header); fallback 22050
+    int sampleRate = 22050;
+    if (http.hasHeader("X-Sample-Rate")) {
+        sampleRate = http.header("X-Sample-Rate").toInt();
+        if (sampleRate < 8000) sampleRate = 22050;
+    }
+
+    int len = http.getSize();
+    // if chunked / unknown size, read up to a safe max
+    if (len <= 0) len = 180000;
+
+    uint8_t* buf = (uint8_t*)malloc(len);
+    if (!buf) {
+        http.end();
+        return;
+    }
+
+    int got = 0;
+    WiFiClient* stream = http.getStreamPtr();
+    while (http.connected() && got < len) {
+        size_t avail = stream->available();
+        if (avail) {
+            int n = stream->readBytes(buf + got, min(avail, (size_t)(len - got)));
+            if (n <= 0) break;
+            got += n;
+        } else {
+            delay(1);
         }
     }
     http.end();
+
+    if (got < 256) {
+        free(buf);
+        return;
+    }
+
+    // playRaw length is in BYTES for M5Unified (PCM16 mono)
+    M5.Speaker.setVolume(128);   // 0-255
+    M5.Speaker.begin();
+    M5.Speaker.playRaw(buf, got, sampleRate, false, 1, 0);
+
+    // keep buffer alive until playback finishes (rough estimate)
+    // 16-bit mono → bytes/2 samples; duration ms ≈ samples*1000/rate
+    uint32_t ms = (uint32_t)((got / 2) * 1000UL / (uint32_t)sampleRate) + 200;
+    delay(ms);
+    free(buf);
 }
 
 void requestImage(const String& prompt) {
