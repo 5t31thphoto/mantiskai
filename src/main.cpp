@@ -397,54 +397,123 @@ void saveImageToSD() {
     }
 }
 
+
 void sendPayloadToServer(String message, String audioBase64 = "") {
-    if (!isConnected) return;
+    if (WiFi.status() != WL_CONNECTED) {
+        isConnected = false;
+        lastReply = "Wi-Fi disconnected";
+        Serial.println("[NET] Wi-Fi is not connected");
+        drawChatUI();
+        return;
+    }
+
+    isConnected = true;
 
     HTTPClient http;
-    http.begin(serverUrl);
+    http.setConnectTimeout(5000);
+    http.setTimeout(30000);
+
+    Serial.printf("[HTTP] POST %s\n", serverUrl.c_str());
+
+    if (!http.begin(serverUrl)) {
+        lastReply = "Invalid server URL";
+        Serial.println("[HTTP] http.begin() failed");
+        drawChatUI();
+        return;
+    }
+
     http.addHeader("Content-Type", "application/json");
 
     JsonDocument doc;
     if (message.length() > 0) doc["message"] = message;
     if (audioBase64.length() > 0) doc["audio_base64"] = audioBase64;
-    
+
     String requestBody;
     serializeJson(doc, requestBody);
 
-    int httpResponseCode = http.POST(requestBody);
+    Serial.printf("[HTTP] Request bytes: %u\n",
+                  (unsigned)requestBody.length());
 
-    if (httpResponseCode > 0) {
-        String responseString = http.getString();
+    int code = http.POST(requestBody);
+
+    Serial.printf("[HTTP] Result: %d (%s)\n",
+                  code,
+                  code < 0 ? http.errorToString(code).c_str() : "HTTP response");
+
+    if (code > 0) {
+        String body = http.getString();
+
+        Serial.printf("[HTTP] Response bytes: %u\n",
+                      (unsigned)body.length());
+        Serial.printf("[HTTP] Body: %s\n", body.c_str());
+
         JsonDocument responseDoc;
-        deserializeJson(responseDoc, responseString);
+        DeserializationError err = deserializeJson(responseDoc, body);
 
-        lastReply = responseDoc["reply"].as<String>();
-        String responseAudio = responseDoc["audio_base64"].as<String>();
+        if (err) {
+            lastReply = "Bad JSON response";
+            Serial.printf("[JSON] Parse failed: %s\n", err.c_str());
+        } else if (code < 200 || code >= 300) {
+            lastReply = responseDoc["error"] | "Server returned HTTP error";
+            Serial.printf("[HTTP] Server error body received\n");
+        } else if (responseDoc["reply"].is<const char*>()) {
+            lastReply = responseDoc["reply"].as<String>();
 
-        if (responseAudio.length() > 0) {
-            size_t decodedLen = 0;
-            mbedtls_base64_decode(NULL, 0, &decodedLen, (const unsigned char*)responseAudio.c_str(), responseAudio.length());
-            if (decodedLen > 0) {
-                unsigned char* audioBytes = (unsigned char*)malloc(decodedLen);
-                size_t actualLen = 0;
-                if (mbedtls_base64_decode(audioBytes, decodedLen, &actualLen, (const unsigned char*)responseAudio.c_str(), responseAudio.length()) == 0) {
-                    M5.Speaker.begin();
-                    M5.Speaker.playRaw((const uint8_t*)audioBytes, actualLen, 22050, false, 1, 0);
+            String responseAudio =
+                responseDoc["audio_base64"].as<String>();
+
+            if (responseAudio.length() > 0) {
+                size_t decodedLen = 0;
+                int rc = mbedtls_base64_decode(
+                    nullptr, 0, &decodedLen,
+                    (const unsigned char*)responseAudio.c_str(),
+                    responseAudio.length());
+
+                if (rc == 0 && decodedLen > 0) {
+                    auto* audioBytes =
+                        (unsigned char*)malloc(decodedLen);
+
+                    if (audioBytes) {
+                        size_t actualLen = 0;
+                        rc = mbedtls_base64_decode(
+                            audioBytes, decodedLen, &actualLen,
+                            (const unsigned char*)responseAudio.c_str(),
+                            responseAudio.length());
+
+                        if (rc == 0) {
+                            M5.Speaker.begin();
+                            M5.Speaker.playRaw(
+                                (const uint8_t*)audioBytes,
+                                actualLen, 22050, false, 1, 0);
+                        } else {
+                            Serial.printf("[AUDIO] Decode failed: %d\n", rc);
+                        }
+                        free(audioBytes);
+                    } else {
+                        Serial.println("[AUDIO] Not enough heap for audio");
+                    }
                 }
-                free(audioBytes);
             }
+        } else {
+            lastReply = responseDoc["error"] | "Missing reply in JSON";
+            Serial.println("[JSON] Response has no reply field");
         }
     } else {
-        lastReply = "Server Error / Unreachable";
+        lastReply = http.errorToString(code);
+        Serial.printf("[HTTP] Connection/request failed: %s\n",
+                      lastReply.c_str());
     }
+
     http.end();
     drawChatUI();
 }
+
 
 void setup() {
     auto cfg = M5.config();
     M5.begin(cfg);
     loadSettings();
+    Serial.printf("[CONFIG] Server URL: %s\n", serverUrl.c_str());
     connectWiFi();
     drawChatUI();
 }
