@@ -771,10 +771,16 @@ void saveImageToSD() {
     if (!currentImageBuffer || !SD.begin(4)) return;
     if (!SD.exists("/images")) SD.mkdir("/images");
     if (!SD.exists("/images/comfy")) SD.mkdir("/images/comfy");
-    String fn = "/images/comfy/img_" + String(millis()) + ".raw";
+
+    String fn = "/images/comfy/img_" + String(millis()) + ".mg";  // was .raw
     File f = SD.open(fn.c_str(), FILE_WRITE);
     if (f) {
-        f.write(currentImageBuffer, 320 * 240 * 2);
+        // MG01 header (what Gallery expects)
+        f.write((const uint8_t*)"MG01", 4);
+        uint16_t w = 320, h = 240;
+        f.write((uint8_t*)&w, 2);
+        f.write((uint8_t*)&h, 2);
+        f.write(currentImageBuffer, 320 * 240 * 2);  // same pixels as now
         f.close();
         lastReply = "Saved " + fn;
     }
