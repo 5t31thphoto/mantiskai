@@ -767,23 +767,57 @@ void startRecording() {
     sendChat(transcript);
 }
 
+void appendComfyIndex(const char* filename) {
+    const char* dir = "/images/comfy";
+    const char* ipath = "/images/comfy/.mg_index";
+
+    std::vector<String> names;
+    if (SD.exists(ipath)) {
+        File f = SD.open(ipath, FILE_READ);
+        if (f) {
+            String magic = f.readStringUntil('\n'); magic.trim();
+            if (magic == "MGIDX1") {
+                f.readStringUntil('\n'); // old count
+                while (f.available()) {
+                    String line = f.readStringUntil('\n');
+                    line.trim();
+                    if (line.length() && line[0] != '.') names.push_back(line);
+                }
+            }
+            f.close();
+        }
+    }
+    // avoid dup if same name somehow
+    for (auto& n : names) if (n == filename) return;
+    names.push_back(String(filename));
+
+    File f = SD.open(ipath, FILE_WRITE);
+    if (!f) return;
+    f.println("MGIDX1");
+    f.println((int)names.size());
+    for (auto& n : names) f.println(n);
+    f.close();
+}
+
 void saveImageToSD() {
     if (!currentImageBuffer || !SD.begin(4)) return;
     if (!SD.exists("/images")) SD.mkdir("/images");
     if (!SD.exists("/images/comfy")) SD.mkdir("/images/comfy");
 
-    String fn = "/images/comfy/img_" + String(millis()) + ".mg";  // was .raw
+    String base = String("img_") + String(millis()) + ".mg";
+    String fn = String("/images/comfy/") + base;
+
     File f = SD.open(fn.c_str(), FILE_WRITE);
-    if (f) {
-        // MG01 header (what Gallery expects)
-        f.write((const uint8_t*)"MG01", 4);
-        uint16_t w = 320, h = 240;
-        f.write((uint8_t*)&w, 2);
-        f.write((uint8_t*)&h, 2);
-        f.write(currentImageBuffer, 320 * 240 * 2);  // same pixels as now
-        f.close();
-        lastReply = "Saved " + fn;
-    }
+    if (!f) return;
+    f.write((const uint8_t*)"MG01", 4);
+    uint16_t w = 320, h = 240;
+    f.write((uint8_t*)&w, 2);
+    f.write((uint8_t*)&h, 2);
+    f.write(currentImageBuffer, 320 * 240 * 2);
+    f.close();
+
+    appendComfyIndex(base.c_str());
+    lastReply = "Saved " + fn;
 }
 
 // ---------- setup / loop ----------
