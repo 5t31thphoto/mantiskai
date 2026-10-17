@@ -316,6 +316,7 @@ void drawReelSymbol(int x, int y, int w, int h, int sym, int animFrame) {
     if (oy < y) oy = y;
     const uint16_t* src = REEL_FRAMES[sym][animFrame];
     static uint16_t line[REEL_W];
+    M5.Display.setSwapBytes(true);
     for (int row = 0; row < REEL_H; row++) {
         if (oy + row < y || oy + row >= y + h) continue;
         for (int col = 0; col < REEL_W; col++) {
@@ -324,6 +325,7 @@ void drawReelSymbol(int x, int y, int w, int h, int sym, int animFrame) {
         }
         M5.Display.pushImage(ox, oy + row, REEL_W, 1, line);
     }
+    M5.Display.setSwapBytes(false);
 }
 
 // Recipe format:
@@ -649,6 +651,7 @@ void drawBusySprite() {
     const int boxH = (currentState == STATE_IMAGE) ? 100 : 128;
 
     static uint16_t line[300];
+    M5.Display.setSwapBytes(true);
     for (int dy = 0; dy < boxH; dy++) {
         int sy = dy * SPRITE_H / boxH;
         for (int dx = 0; dx < boxW; dx++) {
@@ -658,6 +661,7 @@ void drawBusySprite() {
         }
         M5.Display.pushImage(boxX, boxY + dy, boxW, 1, line);
     }
+    M5.Display.setSwapBytes(false);
 }
 
 void drawChatUI() {
@@ -728,6 +732,14 @@ void drawImageUI() {
     M5.Display.print("CFG");
 
     M5.Display.drawRoundRect(8, 40, 304, 110, 6, COLOR_PURPLE);
+
+    if (isRecording || (isBusy && (lastReply == "Transcribing..." || lastReply == "Recording..."))) {
+        M5.Display.fillRoundRect(12, 44, 296, 20, 4, COLOR_TEAL);
+        M5.Display.setTextColor(COLOR_WHITE, COLOR_TEAL);
+        M5.Display.setTextSize(1);
+        M5.Display.setCursor(18, 50);
+        M5.Display.print(isRecording ? "RECORDING AUDIO..." : "TRANSCRIBING AUDIO...");
+    }
 
     if (isBusy) {
         // Full prompt-box paint animation
@@ -1330,13 +1342,12 @@ void fetchAndPlayTTS(const String& text) {
             prefetched = (nextGot >= 512);
         }
 
-        unsigned long playMs = (unsigned long)(samples * 1000UL / (unsigned long)playRate) + 50;
-        unsigned long start = millis();
-        while (M5.Speaker.isPlaying() && (millis() - start) < playMs) {
+        // Never advance on an estimated duration: wait for the hardware queue
+        // to finish this complete chunk before moving to the next one.
+        while (M5.Speaker.isPlaying()) {
             delay(10);
             M5.update();
         }
-        M5.Speaker.stop();
 
         if (!hasMore || !prefetched) break;
 
@@ -1556,7 +1567,7 @@ void startRecording(bool forImage) {
     WiFiClient client;
     HTTPClient http;
     http.setConnectTimeout(15000);
-    http.setTimeout(60000);  // HTTPClient timeout is uint16_t; avoid overflow
+    http.setTimeout(90000);  // Whisper can spike under load
     http.setReuse(false);
     http.useHTTP10(true);
 
@@ -1962,7 +1973,15 @@ void loop() {
                 drawChatUI();
             }
         } else if (currentState == STATE_IMAGE) {
-            if (x > 250 && y < 32) {
+            if (y >= 40 && y <= 150 && lastImagePrompt.length() > 0 && !isBusy) {
+                activeEditingField = nullptr;
+                keyboardTitle = "Image Prompt";
+                keyboardBuffer = lastImagePrompt;
+                kbMode = MODE_LOWER;
+                shiftHeld = false;
+                currentState = STATE_KEYBOARD;
+                drawKeyboardUI();
+            } else if (x > 250 && y < 32) {
                 stateBeforeSettings = STATE_IMAGE;
                 currentState = STATE_SETTINGS;
                 drawSettingsUI();
