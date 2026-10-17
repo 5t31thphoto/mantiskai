@@ -1,0 +1,132 @@
+name: build-firmware
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+  pull_request:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
+jobs:
+  firmware:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Locate sources (self-healing bootstrap)
+        run: |
+          set -e
+          zip=$(ls -t *.zip 2>/dev/null | head -1 || true)
+          if [ -n "$zip" ]; then
+            echo "Expanding $zip"
+            tmp=$(mktemp -d); unzip -oq "$zip" -d "$tmp"
+            entries=$(ls -A "$tmp")
+            if [ "$(echo "$entries" | wc -l)" -eq 1 ] && [ -d "$tmp/$entries" ]; then
+              src="$tmp/$entries"; else src="$tmp"; fi
+            cp -a "$src"/. ./ 2>/dev/null || (cd "$src" && tar cf - . | (cd "$OLDPWD" && tar xf -))
+            rm -rf "$tmp"
+          fi
+          if [ ! -f platformio.ini ]; then
+            found=$(find . -name platformio.ini -not -path './.git/*' | head -1 || true)
+            if [ -n "$found" ]; then
+              root=$(dirname "$found")
+              cp -a "$root"/. ./ 2>/dev/null || (cd "$root" && tar cf - --exclude=.git . | (cd "$GITHUB_WORKSPACE" && tar xf -))
+            fi
+          fi
+          test -f platformio.ini || { echo "::error::platformio.ini not found"; exit 1; }
+          test -f src/main.cpp   || { echo "::error::src/main.cpp not found"; exit 1; }
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install PlatformIO and esptool
+        run: |
+          pip install -U platformio esptool
+          pio --version
+
+      - name: Build firmware (m5stack-core2)
+        run: |
+          pio run -e m5stack-core2
+          find .pio/build -type f \( -name "*.bin" -o -name "*.elf" \) | head -40
+
+      - name: Package dist for web flasher
+        run: |
+          set -e
+          mkdir -p dist
+          BUILD=.pio/build/m5stack-core2
+          cp "$BUILD/bootloader.bin"        dist/bootloader.bin
+          cp "$BUILD/partitions.bin"        dist/partition-table.bin
+          APP=$(ls "$BUILD"/firmware.bin "$BUILD"/m5stack-core2.bin 2>/dev/null | head -1)
+          test -n "$APP"
+          cp "$APP" dist/mantiskai-core2.bin
+          cat > dist/manifest.json << MAN
+          {
+            "name": "MantisKAI Core2",
+            "version": "1.0.0",
+            "new_install_prompt_erase": true,
+            "builds": [{
+              "chipFamily": "ESP32",
+              "parts": [
+                { "path": "bootloader.bin", "offset": 4096 },
+                { "path": "partition-table.bin", "offset": 32768 },
+                { "path": "mantiskai-core2.bin", "offset": 65536 }
+              ]
+            }]
+          }
+          MAN
+
+      - name: Create merged binary
+        run: |
+          python -m esptool --chip esp32 merge_bin -o dist/merged-firmware.bin \
+            0x1000 dist/bootloader.bin \
+            0x8000 dist/partition-table.bin \
+            0x10000 dist/mantiskai-core2.bin
+          ls -la dist/
+
+      - name: Upload firmware artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mantiskai-core2-firmware
+          path: dist/
+
+      - name: Build Pages payload
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        run: |
+          mkdir -p site
+          cp -r web/* site/ 2>/dev/null || true
+          mkdir -p site/firmware
+          cp -r dist/* site/firmware/
+          cp -f IMAGE_SPEC.txt site/IMAGE_SPEC.txt 2>/dev/null || true
+          touch site/.nojekyll
+
+      - name: Setup Pages
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        uses: actions/configure-pages@v5
+
+      - name: Upload Pages artifact
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    needs: firmware
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
