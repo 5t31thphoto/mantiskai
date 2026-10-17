@@ -300,7 +300,7 @@ int pickWeightedSym() {
     return 0;
 }
 
-void drawReelSymbol(int x, int y, int w, int h, int sym, int animFrame = 0) {
+void drawReelSymbol(int x, int y, int w, int h, int sym, int animFrame) {
     if (sym < 0) sym = 0;
     if (sym >= REEL_SYMS) sym = REEL_SYMS - 1;
     if (animFrame < 0) animFrame = 0;
@@ -1556,7 +1556,7 @@ void startRecording(bool forImage) {
     WiFiClient client;
     HTTPClient http;
     http.setConnectTimeout(15000);
-    http.setTimeout(90000);  // Whisper can spike under load
+    http.setTimeout(60000);  // HTTPClient timeout is uint16_t; avoid overflow
     http.setReuse(false);
     http.useHTTP10(true);
 
