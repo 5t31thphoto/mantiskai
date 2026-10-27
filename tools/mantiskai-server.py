@@ -5,6 +5,7 @@ MantisKAI PC Bridge
   POST /api/stt    → {"text": "..."}                           accepts binary WAV/PCM
   POST /api/image  → {"image_base64": "...", "lora": "..."}
   GET|POST /api/lora
+  GET|POST /api/profile                                        C-button profile cycle
 """
 
 import threading
@@ -17,11 +18,12 @@ import json
 import tempfile
 from io import BytesIO
 import urllib.request
-from PIL import Image, ImageTk
+from PIL import Image, ImageTk, ImageOps
 import tkinter as tk
-from tkinter import scrolledtext, ttk, messagebox
+from tkinter import scrolledtext, ttk, messagebox, filedialog
 from flask import Flask, request, jsonify, Response
 from mantiskai_kasa import handle_kasa_chat, register_kasa_routes
+import mantiskai_profiles as mp
 from openai import OpenAI
 
 try:
@@ -75,6 +77,7 @@ DEFAULT_CONFIG = {
     "system_prompt": "You are a helpful, friendly AI assistant communicating through an M5Stack Core2 device.",
     "stt_api_base": "",          # optional OpenAI-compatible STT endpoint, e.g. http://localhost:8080/v1
     "stt_api_key": "lm-studio",
+    "active_profile": "",
 }
 
 # Sliding window: system + this many non-system messages (user/assistant pairs)
@@ -116,6 +119,27 @@ HARDCODED_NEGATIVE = config.get("comfy_negative", DEFAULT_CONFIG["comfy_negative
 SYSTEM_PROMPT = config["system_prompt"]
 STT_API_BASE = config.get("stt_api_base", "")
 STT_API_KEY = config.get("stt_api_key", "lm-studio")
+
+# ComfyUI profiles (C button on the Core2). First run creates Realistic/Anime
+# from the old checkpoint settings so nothing changes until you add more.
+profiles = mp.ProfileStore(mp.PROFILES_DIR)
+if not profiles.names():
+    for _name, _ckpt in (("Realistic", REALISTIC_MODEL), ("Anime", ANIME_MODEL)):
+        profiles.save(mp.basic_profile(_name, _ckpt, HARDCODED_POSITIVE_PREFIX + "{prompt}",
+                                       HARDCODED_NEGATIVE))
+profiles.set_active(config.get("active_profile") or "Realistic")
+
+def set_active_profile(name):
+    name = profiles.set_active(name)
+    config["active_profile"] = name
+    save_config(config)
+    return name
+
+def cycle_profile():
+    name = profiles.cycle()
+    config["active_profile"] = name
+    save_config(config)
+    return name
 
 active_lora_idx = -1
 chat_history = [{"role": "system", "content": SYSTEM_PROMPT}]
@@ -325,70 +349,38 @@ def transcribe_audio(wav_or_pcm_bytes, sample_rate=16000):
         "or set stt_api_base in config.json"
     )
 
-def generate_comfy_image_mg(user_prompt, model_type="realistic", selected_lora=""):
-    full_prompt = HARDCODED_POSITIVE_PREFIX + user_prompt
-    target_ckpt = REALISTIC_MODEL if model_type == "realistic" else ANIME_MODEL
-    workflow = {
-        "3": {
-            "inputs": {
-                "seed": random.randint(1, 1000000000), "steps": 20, "cfg": 7.0,
-                "sampler_name": "euler", "scheduler": "normal", "denoise": 1.0,
-                "model": ["10" if selected_lora else "4", 0], "positive": ["6", 0],
-                "negative": ["7", 0], "latent_image": ["5", 0]
-            },
-            "class_type": "KSampler"
-        },
-        "4": {"inputs": {"ckpt_name": target_ckpt}, "class_type": "CheckpointLoaderSimple"},
-        "5": {"inputs": {"width": 640, "height": 480, "batch_size": 1}, "class_type": "EmptyLatentImage"},
-        "6": {"inputs": {"text": full_prompt, "clip": ["10" if selected_lora else "4", 1]}, "class_type": "CLIPTextEncode"},
-        "7": {"inputs": {"text": HARDCODED_NEGATIVE, "clip": ["10" if selected_lora else "4", 1]}, "class_type": "CLIPTextEncode"},
-        "8": {"inputs": {"samples": ["3", 0], "vae": ["4", 2]}, "class_type": "VAEDecode"},
-        "9": {"inputs": {"filename_prefix": "MantisKAI_Temp", "images": ["8", 0]}, "class_type": "SaveImage"}
-    }
-    if selected_lora:
-        workflow["10"] = {
-            "inputs": {
-                "lora_name": selected_lora,
-                "strength_model": float(LORA_STRENGTH),
-                "strength_clip": float(LORA_STRENGTH),
-                "model": ["4", 0], "clip": ["4", 1]
-            },
-            "class_type": "LoraLoader"
-        }
-    try:
-        data = json.dumps({"prompt": workflow}).encode("utf-8")
-        req = urllib.request.Request(
-            f"http://{COMFY_URL}/prompt", data=data,
-            headers={"Content-Type": "application/json"})
-        response = json.loads(urllib.request.urlopen(req, timeout=10).read().decode("utf-8"))
-        prompt_id = response.get("prompt_id")
-        if not prompt_id:
-            return None, None
-        deadline = time.time() + 90
-        while time.time() < deadline:
-            time.sleep(1.0)
-            history = json.loads(
-                urllib.request.urlopen(f"http://{COMFY_URL}/history/{prompt_id}", timeout=5)
-                .read().decode("utf-8"))
-            if prompt_id in history:
-                images = history[prompt_id].get("outputs", {}).get("9", {}).get("images", [])
-                if images:
-                    info = images[0]
-                    img_url = (f"http://{COMFY_URL}/view?filename={info['filename']}"
-                               f"&subfolder={info['subfolder']}&type={info['type']}")
-                    img_data = urllib.request.urlopen(img_url, timeout=10).read()
-                    original = Image.open(BytesIO(img_data))
-                    img320 = original.resize((320, 240))
-                    rgb565 = bytearray()
-                    for r, g, b in img320.getdata():
-                        # RGB565
-                        val = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3)
-                        # little-endian bytes (matches uint16 on ESP32)
-                        rgb565.append(val & 0xFF)
-                        rgb565.append((val >> 8) & 0xFF)
-                    return original, bytes(rgb565)
+last_image_error = ""
+
+def to_rgb565_320x240(img):
+    """Center-crop to 4:3, scale to the Core2 screen, pack little-endian RGB565."""
+    img320 = ImageOps.fit(img.convert("RGB"), (320, 240), Image.LANCZOS)
+    rgb565 = bytearray()
+    for r, g, b in img320.getdata():
+        val = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3)
+        rgb565.append(val & 0xFF)
+        rgb565.append((val >> 8) & 0xFF)
+    return bytes(rgb565)
+
+def generate_with_profile(profile, user_prompt, selected_lora="", timeout=140):
+    """Run one profile (dict). Returns PIL image; raises mp.ProfileError."""
+    graph, out_id = mp.build_prompt_graph(profile, user_prompt, selected_lora, LORA_STRENGTH)
+    print(f"[Comfy] profile={profile['name']} lora={selected_lora or 'None'} "
+          f"{profile.get('width')}x{profile.get('height')}")
+    return mp.run_on_comfy(COMFY_URL, graph, out_id, timeout=timeout)
+
+def generate_comfy_image_mg(user_prompt, profile_name="", selected_lora=""):
+    """Returns (PIL original, rgb565 bytes) or (None, None) with last_image_error set."""
+    global last_image_error
+    last_image_error = ""
+    profile = profiles.get(profile_name) or profiles.get(profiles.active_name())
+    if not profile:
+        last_image_error = "No profiles. Create one in the Profiles tab."
         return None, None
+    try:
+        original = generate_with_profile(profile, user_prompt, selected_lora)
+        return original, to_rgb565_320x240(original)
     except Exception as e:
+        last_image_error = str(e)
         print(f"[Comfy] {e}")
         return None, None
 
@@ -410,6 +402,25 @@ def api_lora():
         return jsonify({"error": "unknown action"}), 400
     print(f"[LoRA] → {name}")
     return jsonify({"lora": name, "index": active_lora_idx, "list": LORA_LIST})
+
+def profile_state():
+    return {"profile": profiles.active_name(), "index": profiles.active,
+            "list": profiles.names(), "lora": current_lora_name()}
+
+@app.route("/api/profile", methods=["GET", "POST"])
+def api_profile():
+    if request.method == "GET":
+        return jsonify(profile_state())
+    data = request.json or {}
+    action = (data.get("action") or "").strip().lower()
+    if action == "cycle":
+        name = cycle_profile()
+    elif action == "set":
+        name = set_active_profile((data.get("name") or "").strip())
+    else:
+        return jsonify({"error": "unknown action"}), 400
+    print(f"[PROFILE] → {name}")
+    return jsonify(profile_state())
 
 @app.route("/api/chat", methods=["POST"])
 def api_chat():
@@ -558,7 +569,9 @@ def api_image():
     """
     data = request.json or {}
     prompt = (data.get("prompt") or "").strip()
-    model_type = (data.get("model_type") or "realistic").strip()
+    profile_name = (data.get("profile") or "").strip()
+    if not profiles.get(profile_name):
+        profile_name = profiles.active_name()
     selected = (data.get("lora") or "").strip()
     if not selected and active_lora_idx >= 0:
         selected = current_lora_name()
@@ -575,16 +588,18 @@ def api_image():
     global _gpu_busy
     _gpu_busy = True
     try:
-        pil, rgb565 = generate_comfy_image_mg(prompt, model_type=model_type, selected_lora=selected)
+        pil, rgb565 = generate_comfy_image_mg(prompt, profile_name=profile_name, selected_lora=selected)
         if not rgb565:
-            return jsonify({"error": "Image generation failed", "lora": current_lora_name()}), 500
-        print(f"[IMG] {len(rgb565)} rgb565 bytes, lora={current_lora_name()}")
+            return jsonify({"error": last_image_error or "Image generation failed",
+                            "lora": current_lora_name()}), 500
+        print(f"[IMG] {len(rgb565)} rgb565 bytes, profile={profile_name}, lora={current_lora_name()}")
         return Response(
             rgb565,
             mimetype="application/octet-stream",
             headers={
                 "Content-Length": str(len(rgb565)),
                 "X-Lora": current_lora_name(),
+                "X-Profile": profile_name,
                 "X-Width": "320",
                 "X-Height": "240",
             },
@@ -600,7 +615,7 @@ class Core2ServerGUI:
     def __init__(self, root):
         self.root = root
         self.root.title("MantisKAI – PC Bridge")
-        self.root.geometry("820x760")
+        self.root.geometry("1000x820")
         self.root.configure(bg="#121212")
         style = ttk.Style()
         style.theme_use("clam")
@@ -621,11 +636,14 @@ class Core2ServerGUI:
         self.chat_tab = ttk.Frame(nb)
         self.image_tab = ttk.Frame(nb)
         self.settings_tab = ttk.Frame(nb)
+        self.profiles_tab = ttk.Frame(nb)
         nb.add(self.chat_tab, text="Chat & Status")
         nb.add(self.image_tab, text="Picture Mode")
+        nb.add(self.profiles_tab, text="Profiles")
         nb.add(self.settings_tab, text="Settings")
         self.setup_chat()
         self.setup_image()
+        self.setup_profiles()
         self.setup_settings()
         self.root.after(500, lambda: threading.Thread(target=self.check_lm, daemon=True).start())
 
@@ -670,10 +688,10 @@ class Core2ServerGUI:
         pad.pack(fill=tk.BOTH, expand=True)
         ctrl = ttk.Frame(pad)
         ctrl.pack(fill=tk.X, pady=(0, 10))
-        ttk.Label(ctrl, text="Model:").grid(row=0, column=0, sticky=tk.W)
-        self.model_var = tk.StringVar(value="realistic")
-        ttk.Radiobutton(ctrl, text="Realistic", variable=self.model_var, value="realistic").grid(row=0, column=1, padx=5)
-        ttk.Radiobutton(ctrl, text="Anime", variable=self.model_var, value="anime").grid(row=0, column=2, padx=5)
+        ttk.Label(ctrl, text="Profile:").grid(row=0, column=0, sticky=tk.W)
+        self.img_profile_combo = ttk.Combobox(ctrl, values=profiles.names(), width=24, state="readonly")
+        self.img_profile_combo.grid(row=0, column=1, columnspan=2, padx=5)
+        self.img_profile_combo.set(profiles.active_name())
         ttk.Label(ctrl, text="LoRA:").grid(row=0, column=3, padx=(20, 5))
         self.lora_combo = ttk.Combobox(ctrl, values=["None"] + LORA_LIST, width=22, state="readonly")
         self.lora_combo.grid(row=0, column=4)
@@ -693,19 +711,421 @@ class Core2ServerGUI:
         prompt = self.img_input.get().strip()
         if not prompt:
             return
-        model = self.model_var.get()
+        prof = self.img_profile_combo.get()
         sel = self.lora_combo.get()
         lora = "" if sel == "None" else sel
         self.img_label.config(text="Generating...")
         def work():
-            pil, _ = generate_comfy_image_mg(prompt, model_type=model, selected_lora=lora)
+            pil, _ = generate_comfy_image_mg(prompt, profile_name=prof, selected_lora=lora)
             if pil:
                 disp = pil.resize((400, 300))
                 self.photo = ImageTk.PhotoImage(disp)
                 self.root.after(0, lambda: self.img_label.config(image=self.photo, text=""))
                 self.root.after(0, lambda: self.log("Comfy", prompt[:50]))
             else:
-                self.root.after(0, lambda: self.img_label.config(text="Failed"))
+                err = last_image_error or "Failed"
+                self.root.after(0, lambda: self.img_label.config(text=f"Failed: {err}"))
+        threading.Thread(target=work, daemon=True).start()
+
+    # ------------------------------------------------------------------
+    # Profiles tab: build, import (ComfyUI PNG / API JSON), edit and test
+    # ------------------------------------------------------------------
+    def setup_profiles(self):
+        self.p_cur = None          # working copy being edited
+        self.p_orig_name = None    # its name on disk; None = not saved yet
+        self.p_notes = []
+        self.p_photo = None
+        self.p_last_active = None
+
+        dark = dict(bg="#1e1e1e", fg="#ffffff", insertbackground="#ffffff",
+                    relief=tk.FLAT, highlightthickness=1)
+        outer = ttk.Frame(self.profiles_tab, padding=10)
+        outer.pack(fill=tk.BOTH, expand=True)
+
+        # ---- left: list + actions
+        left = ttk.Frame(outer)
+        left.pack(side=tk.LEFT, fill=tk.Y)
+        ttk.Label(left, text="Profiles (C button order)", style="Header.TLabel").pack(anchor=tk.W)
+        self.p_list = tk.Listbox(left, width=26, height=16, font=("Arial", 10),
+                                 bg="#1e1e1e", fg="#ffffff", selectbackground="#007373",
+                                 exportselection=False, relief=tk.FLAT)
+        self.p_list.pack(fill=tk.Y, pady=(4, 8))
+        self.p_list.bind("<<ListboxSelect>>", self.p_on_select)
+        for text, cmd in (("New (basic)", self.p_new_basic),
+                          ("Import PNG / API JSON", self.p_import),
+                          ("Duplicate", self.p_duplicate),
+                          ("Delete", self.p_delete),
+                          ("Use on Core2", self.p_use_on_core2)):
+            ttk.Button(left, text=text, command=cmd).pack(fill=tk.X, pady=2)
+        self.p_active_label = ttk.Label(left, text="", wraplength=200)
+        self.p_active_label.pack(anchor=tk.W, pady=(8, 0))
+
+        # ---- right: editor
+        right = ttk.Frame(outer)
+        right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(12, 0))
+
+        form = ttk.Frame(right)
+        form.pack(fill=tk.X)
+        form.columnconfigure(1, weight=1)
+        ttk.Label(form, text="Name:").grid(row=0, column=0, sticky=tk.W, pady=2)
+        self.p_name = tk.Entry(form, font=("Arial", 10), **dark)
+        self.p_name.grid(row=0, column=1, columnspan=4, sticky=tk.EW, pady=2, ipady=2)
+        ttk.Label(form, text="Prompt template:").grid(row=1, column=0, sticky=tk.W, pady=2)
+        self.p_template = tk.Entry(form, font=("Arial", 10), **dark)
+        self.p_template.grid(row=1, column=1, columnspan=4, sticky=tk.EW, pady=2, ipady=2)
+        ttk.Label(form, text="{prompt} is replaced by what you type or say on the Core2",
+                  font=("Arial", 8)).grid(row=2, column=1, columnspan=4, sticky=tk.W)
+        ttk.Label(form, text="Negative:").grid(row=3, column=0, sticky=tk.W, pady=2)
+        self.p_negative = tk.Entry(form, font=("Arial", 10), **dark)
+        self.p_negative.grid(row=3, column=1, columnspan=4, sticky=tk.EW, pady=2, ipady=2)
+        ttk.Label(form, text="Size (always 1 image):").grid(row=4, column=0, sticky=tk.W, pady=2)
+        self.p_width = tk.Entry(form, width=6, font=("Arial", 10), **dark)
+        self.p_width.grid(row=4, column=1, sticky=tk.W, pady=2, ipady=2)
+        ttk.Label(form, text="x").grid(row=4, column=2, sticky=tk.W, padx=4)
+        self.p_height = tk.Entry(form, width=6, font=("Arial", 10), **dark)
+        self.p_height.grid(row=4, column=3, sticky=tk.W, pady=2, ipady=2)
+        ttk.Label(form, text="4:3 fits the screen; 640x480 for SD1.5, 1024x768 for SDXL/Flux",
+                  font=("Arial", 8)).grid(row=4, column=4, sticky=tk.W, padx=8)
+
+        src = ttk.Frame(right)
+        src.pack(fill=tk.X, pady=(6, 0))
+        ttk.Label(src, text="Prompt in the imported image:").pack(side=tk.LEFT)
+        ttk.Button(src, text="Use as template", command=self.p_use_source).pack(side=tk.RIGHT)
+        self.p_source = scrolledtext.ScrolledText(right, height=2, wrap=tk.WORD, font=("Arial", 9),
+                                                  bg="#1e1e1e", fg="#bbbbbb", borderwidth=0)
+        self.p_source.pack(fill=tk.X, pady=(2, 6))
+
+        ttk.Label(right, text="What the server does with this workflow:").pack(anchor=tk.W)
+        self.p_report = scrolledtext.ScrolledText(right, height=7, wrap=tk.WORD, font=("Consolas", 9),
+                                                  bg="#1e1e1e", fg="#00ff00", borderwidth=0)
+        self.p_report.pack(fill=tk.X, pady=(2, 6))
+
+        bottom = ttk.Frame(right)
+        bottom.pack(fill=tk.BOTH, expand=True)
+
+        # node settings (left of bottom)
+        nodes = ttk.Frame(bottom)
+        nodes.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        ttk.Label(nodes, text="Node settings (sampler, steps, cfg, models...):").pack(anchor=tk.W)
+        cols = ("node", "class", "input", "value")
+        tree_wrap = ttk.Frame(nodes)
+        tree_wrap.pack(fill=tk.BOTH, expand=True)
+        self.p_tree = ttk.Treeview(tree_wrap, columns=cols, show="headings", height=9)
+        for c, w in zip(cols, (60, 150, 110, 200)):
+            self.p_tree.heading(c, text=c)
+            self.p_tree.column(c, width=w, stretch=(c == "value"))
+        sb = ttk.Scrollbar(tree_wrap, orient=tk.VERTICAL, command=self.p_tree.yview)
+        self.p_tree.configure(yscrollcommand=sb.set)
+        self.p_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+        self.p_tree.bind("<<TreeviewSelect>>", self.p_on_tree_select)
+        edit = ttk.Frame(nodes)
+        edit.pack(fill=tk.X, pady=(4, 0))
+        self.p_value = tk.Entry(edit, font=("Arial", 10), **dark)
+        self.p_value.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=2, padx=(0, 6))
+        self.p_value.bind("<Return>", lambda e: self.p_set_value())
+        ttk.Button(edit, text="Set value", command=self.p_set_value).pack(side=tk.LEFT)
+        ttk.Button(nodes, text="Save profile", command=self.p_save).pack(anchor=tk.E, pady=(8, 0))
+
+        # test panel (right of bottom)
+        test = ttk.Frame(bottom)
+        test.pack(side=tk.LEFT, fill=tk.Y, padx=(12, 0))
+        ttk.Label(test, text="Test (uses the unsaved edits too):").pack(anchor=tk.W)
+        self.p_test_prompt = tk.Entry(test, width=40, font=("Arial", 10), **dark)
+        self.p_test_prompt.pack(fill=tk.X, ipady=3, pady=2)
+        self.p_test_prompt.insert(0, "a mantis wearing headphones")
+        self.p_test_prompt.bind("<Return>", lambda e: self.p_test())
+        trow = ttk.Frame(test)
+        trow.pack(fill=tk.X, pady=2)
+        ttk.Label(trow, text="LoRA:").pack(side=tk.LEFT)
+        self.p_lora_combo = ttk.Combobox(trow, values=["None"] + LORA_LIST, width=20, state="readonly")
+        self.p_lora_combo.set("None")
+        self.p_lora_combo.pack(side=tk.LEFT, padx=4)
+        ttk.Button(trow, text="Test", command=self.p_test).pack(side=tk.RIGHT)
+        self.p_img = tk.Label(test, text="320x240 preview\n(what the Core2 shows)",
+                              width=320, height=240, bg="#000000", fg="#777777")
+        self.p_img.pack(pady=(6, 4))
+        self.p_status = ttk.Label(test, text="", wraplength=320)
+        self.p_status.pack(anchor=tk.W)
+
+        self.refresh_profile_lists()
+        active = profiles.active_name()
+        if active:
+            self.p_load(profiles.get(active), active)
+        self.root.after(2000, self.p_poll)
+
+    # ---- list / state
+    def refresh_profile_lists(self, select=None):
+        names = profiles.names()
+        active = profiles.active_name()
+        self.p_list.delete(0, tk.END)
+        for n in names:
+            self.p_list.insert(tk.END, ("▶ " if n == active else "   ") + n)
+        target = select or self.p_orig_name
+        if target in names:
+            i = names.index(target)
+            self.p_list.selection_clear(0, tk.END)
+            self.p_list.selection_set(i)
+            self.p_list.see(i)
+        self.p_active_label.config(text=f"Core2 is using: {active or 'none'}")
+        self.img_profile_combo.config(values=names)
+        if self.img_profile_combo.get() not in names:
+            self.img_profile_combo.set(active)
+        self.p_last_active = active
+
+    def p_poll(self):
+        # The Core2 can change the active profile/LoRA at any time
+        if profiles.active_name() != self.p_last_active:
+            self.refresh_profile_lists()
+        self.lora_label.config(text=f"LoRA: {current_lora_name()}")
+        self.root.after(2000, self.p_poll)
+
+    def p_discard_ok(self):
+        if self.p_cur is not None and self.p_orig_name is None:
+            return messagebox.askyesno("Unsaved profile",
+                                       "This profile has not been saved. Discard it?")
+        return True
+
+    def p_on_select(self, _event=None):
+        sel = self.p_list.curselection()
+        if not sel:
+            return
+        name = profiles.names()[sel[0]]
+        if name == self.p_orig_name:
+            return
+        if not self.p_discard_ok():
+            self.refresh_profile_lists()
+            return
+        self.p_load(profiles.get(name), name)
+
+    # ---- editor
+    def p_load(self, profile, orig_name, notes=None):
+        self.p_cur = profile
+        self.p_orig_name = orig_name
+        self.p_notes = notes or []
+        for entry, val in ((self.p_name, profile.get("name", "")),
+                           (self.p_template, profile.get("template", "{prompt}")),
+                           (self.p_negative, profile.get("negative", "")),
+                           (self.p_width, str(profile.get("width", 640))),
+                           (self.p_height, str(profile.get("height", 480)))):
+            entry.delete(0, tk.END)
+            entry.insert(0, val)
+        self.p_source.config(state=tk.NORMAL)
+        self.p_source.delete("1.0", tk.END)
+        self.p_source.insert(tk.END, profile.get("source_prompt", "") or "(none)")
+        self.p_source.config(state=tk.DISABLED)
+        self.p_fill_tree()
+        self.p_refresh_report()
+        self.p_status.config(text="" if orig_name else "Not saved yet.")
+
+    def p_fill_tree(self):
+        self.p_tree.delete(*self.p_tree.get_children())
+        wf = self.p_cur["workflow"]
+        def key(nid):
+            return (0, int(nid), "") if nid.isdigit() else (1, 0, nid)
+        for nid in sorted(wf, key=key):
+            node = wf[nid]
+            for k, v in node["inputs"].items():
+                if mp.is_link(v) or isinstance(v, (dict, list)):
+                    continue
+                self.p_tree.insert("", tk.END, iid=f"{nid}\x1f{k}",
+                                   values=(nid, node["class_type"], k, str(v)))
+
+    def p_collect(self):
+        """Profile from the editor fields (raises ValueError on bad size)."""
+        p = dict(self.p_cur)
+        p["name"] = self.p_name.get().strip()
+        p["template"] = self.p_template.get().strip() or "{prompt}"
+        p["negative"] = self.p_negative.get().strip()
+        w, h = int(self.p_width.get()), int(self.p_height.get())
+        if not (64 <= w <= 2048 and 64 <= h <= 2048):
+            raise ValueError("Size must be between 64 and 2048.")
+        p["width"], p["height"] = w - w % 8, h - h % 8
+        return p
+
+    def p_refresh_report(self):
+        text = mp.describe(self.p_cur)
+        if self.p_notes:
+            text += "\n\nImport changes:\n- " + "\n- ".join(self.p_notes)
+        self.p_report.config(state=tk.NORMAL)
+        self.p_report.delete("1.0", tk.END)
+        self.p_report.insert(tk.END, text)
+        self.p_report.config(state=tk.DISABLED)
+
+    def p_on_tree_select(self, _event=None):
+        sel = self.p_tree.selection()
+        if not sel:
+            return
+        self.p_value.delete(0, tk.END)
+        self.p_value.insert(0, self.p_tree.item(sel[0], "values")[3])
+
+    def p_set_value(self):
+        sel = self.p_tree.selection()
+        if not sel or not self.p_cur:
+            return
+        nid, k = sel[0].split("\x1f", 1)
+        inputs = self.p_cur["workflow"][nid]["inputs"]
+        old, raw = inputs[k], self.p_value.get()
+        try:
+            if isinstance(old, bool):
+                new = raw.strip().lower() in ("1", "true", "yes", "on")
+            elif isinstance(old, int):
+                new = int(raw)
+            elif isinstance(old, float):
+                new = float(raw)
+            else:
+                new = raw
+        except ValueError:
+            messagebox.showerror("Bad value", f"{k} needs a {type(old).__name__}.")
+            return
+        inputs[k] = new
+        self.p_tree.item(sel[0], values=(nid, self.p_cur["workflow"][nid]["class_type"], k, str(new)))
+        self.p_refresh_report()
+
+    def p_use_source(self):
+        src = (self.p_cur or {}).get("source_prompt", "").strip()
+        if not src:
+            return
+        self.p_template.delete(0, tk.END)
+        self.p_template.insert(0, "{prompt}, " + src.replace("\n", " "))
+
+    # ---- actions
+    def p_new_basic(self):
+        if not self.p_discard_ok():
+            return
+        p = mp.basic_profile("New profile", REALISTIC_MODEL,
+                             HARDCODED_POSITIVE_PREFIX + "{prompt}", HARDCODED_NEGATIVE)
+        self.p_load(p, None, ["Basic txt2img. Set the checkpoint in node 4 (ckpt_name) "
+                              "and the sampler settings in node 3, then save."])
+
+    def p_import(self):
+        if not self.p_discard_ok():
+            return
+        path = filedialog.askopenfilename(
+            title="ComfyUI image or API workflow",
+            filetypes=[("ComfyUI image or API JSON", "*.png *.json"), ("All files", "*.*")])
+        if not path:
+            return
+        try:
+            graph = mp.read_comfy_file(path)
+            name = os.path.splitext(os.path.basename(path))[0][:40]
+            profile, notes = mp.profile_from_graph(graph, name)
+        except mp.ProfileError as e:
+            messagebox.showerror("Import failed", str(e))
+            return
+        except Exception as e:
+            messagebox.showerror("Import failed", f"{type(e).__name__}: {e}")
+            return
+        self.p_load(profile, None, notes)
+        self.log("SYSTEM", f"Imported workflow from {os.path.basename(path)} (not saved yet)")
+
+    def p_duplicate(self):
+        if not self.p_cur or not self.p_discard_ok():
+            return
+        try:
+            p = self.p_collect()
+        except ValueError as e:
+            messagebox.showerror("Bad size", str(e))
+            return
+        p = json.loads(json.dumps({k: v for k, v in p.items() if not k.startswith("_")}))
+        p["name"] = p["name"] + " copy"
+        self.p_load(p, None)
+
+    def p_save(self):
+        if not self.p_cur:
+            return
+        try:
+            p = self.p_collect()
+        except ValueError as e:
+            messagebox.showerror("Bad size", str(e))
+            return
+        if not p["name"]:
+            messagebox.showerror("Name needed", "Give the profile a name.")
+            return
+        if self.p_orig_name is None and profiles.get(p["name"]):
+            if not messagebox.askyesno("Replace?", f"Replace the existing profile '{p['name']}'?"):
+                return
+        try:
+            profiles.save(p, old_name=self.p_orig_name)
+        except mp.ProfileError as e:
+            messagebox.showerror("Save failed", str(e))
+            return
+        config["active_profile"] = profiles.active_name()
+        save_config(config)
+        self.p_orig_name = p["name"]
+        self.p_cur = profiles.get(p["name"])
+        self.p_notes = []
+        self.refresh_profile_lists(select=p["name"])
+        self.p_refresh_report()
+        self.p_status.config(text="Saved.")
+        self.log("SYSTEM", f"Profile saved: {p['name']}")
+
+    def p_delete(self):
+        if self.p_orig_name is None:
+            self.p_cur = None
+            active = profiles.active_name()
+            if active:
+                self.p_load(profiles.get(active), active)
+            return
+        if len(profiles.names()) <= 1:
+            messagebox.showinfo("Keep one", "Keep at least one profile.")
+            return
+        if not messagebox.askyesno("Delete", f"Delete profile '{self.p_orig_name}'?"):
+            return
+        profiles.delete(self.p_orig_name)
+        config["active_profile"] = profiles.active_name()
+        save_config(config)
+        first = profiles.active_name()
+        self.p_load(profiles.get(first), first)
+        self.refresh_profile_lists(select=first)
+
+    def p_use_on_core2(self):
+        if self.p_orig_name is None:
+            messagebox.showinfo("Save first", "Save the profile before using it on the Core2.")
+            return
+        set_active_profile(self.p_orig_name)
+        self.refresh_profile_lists(select=self.p_orig_name)
+        self.log("SYSTEM", f"Core2 profile → {self.p_orig_name}")
+
+    def p_test(self):
+        if not self.p_cur:
+            return
+        prompt = self.p_test_prompt.get().strip()
+        if not prompt:
+            return
+        try:
+            profile = self.p_collect()
+        except ValueError as e:
+            messagebox.showerror("Bad size", str(e))
+            return
+        sel = self.p_lora_combo.get()
+        lora = "" if sel == "None" else sel
+        self.p_status.config(text="Generating...")
+
+        def work():
+            global _gpu_busy
+            if not _gpu_lock.acquire(blocking=False):
+                self.root.after(0, lambda: self.p_status.config(
+                    text="Busy: the Core2 or chat is using the GPU. Try again in a moment."))
+                return
+            _gpu_busy = True
+            t0 = time.time()
+            try:
+                img = generate_with_profile(profile, prompt, lora, timeout=600)
+                shown = ImageOps.fit(img, (320, 240), Image.LANCZOS)
+                secs = time.time() - t0
+                def show():
+                    self.p_photo = ImageTk.PhotoImage(shown)
+                    self.p_img.config(image=self.p_photo, text="", width=320, height=240)
+                    self.p_status.config(text=f"OK in {secs:.0f}s, {img.width}x{img.height}"
+                                              f"{', LoRA ' + lora if lora else ''}")
+                self.root.after(0, show)
+            except Exception as e:
+                msg = str(e)
+                self.root.after(0, lambda: self.p_status.config(text=f"Failed: {msg}"))
+            finally:
+                _gpu_busy = False
+                _gpu_lock.release()
         threading.Thread(target=work, daemon=True).start()
 
     def setup_settings(self):
@@ -796,6 +1216,8 @@ class Core2ServerGUI:
         save_config(config)
 
         self.lora_label.config(text=f"LoRA: {current_lora_name()}")
+        self.lora_combo.config(values=["None"] + LORA_LIST)
+        self.p_lora_combo.config(values=["None"] + LORA_LIST)
         self.log("SYSTEM", "Settings saved")
         messagebox.showinfo("OK", "Configuration applied")
 
