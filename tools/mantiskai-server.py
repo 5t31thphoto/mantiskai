@@ -16,12 +16,13 @@ import base64
 import os
 import json
 import tempfile
+import re
 from io import BytesIO
 import urllib.request
 from PIL import Image, ImageTk, ImageOps
 import tkinter as tk
 from tkinter import scrolledtext, ttk, messagebox, filedialog
-from flask import Flask, request, jsonify, Response
+from flask import Flask, request, jsonify, Response, has_request_context
 from mantiskai_kasa import handle_kasa_chat, register_kasa_routes
 import mantiskai_profiles as mp
 from openai import OpenAI
@@ -78,6 +79,8 @@ DEFAULT_CONFIG = {
     "stt_api_base": "",          # optional OpenAI-compatible STT endpoint, e.g. http://localhost:8080/v1
     "stt_api_key": "lm-studio",
     "active_profile": "",
+    "hidden_lora_list": "",       # only offered after the hidden-options keyword
+    "hidden_keyword": "",         # "keyword for hidden options"; empty = disabled
 }
 
 # Sliding window: system + this many non-system messages (user/assistant pairs)
@@ -109,10 +112,12 @@ AI_MODEL = config["ai_model"]
 TTS_VOICE_PATH = "assets/voices/en_GB-vctk-medium.onnx"
 TTS_VOLUME = 0.8
 FLASK_PORT = 5000
-COMFY_URL = "127.0.0.1:8000"
+COMFY_URL = config.get("comfy_url", "127.0.0.1:8000")
 REALISTIC_MODEL = config["realistic_model"]
 ANIME_MODEL = config["anime_model"]
 LORA_LIST = [x.strip() for x in config["lora_list"].split(",") if x.strip()]
+HIDDEN_LORA_LIST = [x.strip() for x in config.get("hidden_lora_list", "").split(",") if x.strip()]
+HIDDEN_KEYWORD = config.get("hidden_keyword", "").strip()
 LORA_STRENGTH = float(config["lora_strength"])
 HARDCODED_POSITIVE_PREFIX = config["comfy_prefix"]
 HARDCODED_NEGATIVE = config.get("comfy_negative", DEFAULT_CONFIG["comfy_negative"])
@@ -129,19 +134,6 @@ if not profiles.names():
                                        HARDCODED_NEGATIVE))
 profiles.set_active(config.get("active_profile") or "Realistic")
 
-def set_active_profile(name):
-    name = profiles.set_active(name)
-    config["active_profile"] = name
-    save_config(config)
-    return name
-
-def cycle_profile():
-    name = profiles.cycle()
-    config["active_profile"] = name
-    save_config(config)
-    return name
-
-active_lora_idx = -1
 chat_history = [{"role": "system", "content": SYSTEM_PROMPT}]
 client = OpenAI(base_url=API_BASE_URL, api_key=USER_API_KEY)
 
@@ -189,25 +181,124 @@ def update_system_prompt(new_prompt):
     SYSTEM_PROMPT = new_prompt
     chat_history = [{"role": "system", "content": SYSTEM_PROMPT}]
 
-def current_lora_name():
-    if 0 <= active_lora_idx < len(LORA_LIST):
-        return LORA_LIST[active_lora_idx]
+# ------------------------------------------------------------------
+# Per-device sessions
+# Each Core2 sends a random X-Session id that changes every boot / Wi-Fi
+# connect. Its selected profile + LoRA and the hidden-options unlock live
+# here, so other devices on the network are unaffected. Idle sessions expire.
+# ------------------------------------------------------------------
+SESSION_IDLE_SECS = 30 * 60
+_sessions = {}
+_sessions_lock = threading.RLock()
+_last_device_key = None
+
+
+def session(key=None):
+    global _last_device_key
+    ip = ""
+    if key is None:
+        if has_request_context():
+            ip = request.remote_addr or ""
+            key = request.headers.get("X-Session") or f"ip:{ip}"
+        else:
+            key = _last_device_key or "gui"
+    with _sessions_lock:
+        now = time.time()
+        for k in [k for k, v in _sessions.items()
+                  if k != "gui" and now - v["seen"] > SESSION_IDLE_SECS]:
+            del _sessions[k]
+            if k == _last_device_key:
+                _last_device_key = None
+        s = _sessions.get(key)
+        if s is None:
+            s = {"unlocked": False, "profile": "", "lora": "None", "seen": now, "ip": ip}
+            _sessions[key] = s
+        if ip:
+            s["seen"], s["ip"] = now, ip
+            _last_device_key = key
+        _sanitize_session(s)
+        return s
+
+
+def visible_loras(s):
+    return LORA_LIST + (HIDDEN_LORA_LIST if s["unlocked"] else [])
+
+
+def visible_profiles(s):
+    return [n for n, hidden in profiles.entries() if s["unlocked"] or not hidden]
+
+
+def _sanitize_session(s):
+    names = visible_profiles(s)
+    if s["profile"] not in names:
+        default = profiles.active_name()
+        s["profile"] = default if default in names else (names[0] if names else "")
+    if s["lora"] != "None" and s["lora"] not in visible_loras(s):
+        s["lora"] = "None"
+
+
+def check_unlock(text, s):
+    """If the hidden-options keyword is in the text, unlock this session.
+    Returns the text with the keyword removed (for image prompts)."""
+    kw = HIDDEN_KEYWORD.strip()
+    if not kw or not text:
+        return text
+    pat = re.compile(r"\b" + re.escape(kw) + r"\b", re.IGNORECASE)
+    if not pat.search(text):
+        return text
+    if not s["unlocked"]:
+        s["unlocked"] = True
+        print(f"[SESSION] hidden options unlocked for {s.get('ip') or 'this session'}")
+    stripped = pat.sub("", text).strip(" ,.;:!?-")
+    return stripped or text
+
+
+def current_lora_name(s=None):
+    return (s or session())["lora"]
+
+
+def cycle_lora(s=None):
+    s = s or session()
+    names = visible_loras(s)
+    i = names.index(s["lora"]) + 1 if s["lora"] in names else 0
+    s["lora"] = names[i] if i < len(names) else "None"
+    return s["lora"]
+
+
+def clear_lora(s=None):
+    s = s or session()
+    s["lora"] = "None"
     return "None"
 
-def cycle_lora():
-    global active_lora_idx
-    if not LORA_LIST:
-        active_lora_idx = -1
-        return "None"
-    active_lora_idx += 1
-    if active_lora_idx >= len(LORA_LIST):
-        active_lora_idx = -1
-    return current_lora_name()
 
-def clear_lora():
-    global active_lora_idx
-    active_lora_idx = -1
-    return "None"
+def cycle_profile(s=None):
+    s = s or session()
+    names = visible_profiles(s)
+    if not names:
+        return ""
+    i = names.index(s["profile"]) + 1 if s["profile"] in names else 0
+    s["profile"] = names[i % len(names)]
+    return s["profile"]
+
+
+def set_active_profile(name):
+    """Default profile for new devices; also applied to devices that can see it."""
+    name = profiles.set_active(name)
+    config["active_profile"] = name
+    save_config(config)
+    with _sessions_lock:
+        for s in _sessions.values():
+            if name in visible_profiles(s):
+                s["profile"] = name
+    return name
+
+
+def device_status_text():
+    with _sessions_lock:
+        if not _last_device_key or _last_device_key not in _sessions:
+            return "No Core2 connected yet"
+        s = _sessions[_last_device_key]
+        return f"Core2 {s['ip']}: {s['profile'] or '-'} | LoRA: {s['lora']}"
 
 def split_tts_chunks(text, max_chars=140):
     """
@@ -389,48 +480,53 @@ def generate_comfy_image_mg(user_prompt, profile_name="", selected_lora=""):
 # ------------------------------------------------------------------
 @app.route("/api/lora", methods=["GET", "POST"])
 def api_lora():
-    global active_lora_idx
-    if request.method == "GET":
-        return jsonify({"lora": current_lora_name(), "index": active_lora_idx, "list": LORA_LIST})
-    data = request.json or {}
-    action = (data.get("action") or "").strip().lower()
-    if action == "cycle":
-        name = cycle_lora()
-    elif action == "clear":
-        name = clear_lora()
-    else:
-        return jsonify({"error": "unknown action"}), 400
-    print(f"[LoRA] → {name}")
-    return jsonify({"lora": name, "index": active_lora_idx, "list": LORA_LIST})
+    s = session()
+    if request.method == "POST":
+        action = ((request.json or {}).get("action") or "").strip().lower()
+        if action == "cycle":
+            cycle_lora(s)
+        elif action == "clear":
+            clear_lora(s)
+        else:
+            return jsonify({"error": "unknown action"}), 400
+        print(f"[LoRA] {s['ip']} → {s['lora']}")
+    names = visible_loras(s)
+    return jsonify({"lora": s["lora"], "index": names.index(s["lora"]) if s["lora"] in names else -1,
+                    "list": names})
 
-def profile_state():
-    return {"profile": profiles.active_name(), "index": profiles.active,
-            "list": profiles.names(), "lora": current_lora_name()}
+def profile_state(s):
+    names = visible_profiles(s)
+    return {"profile": s["profile"], "index": names.index(s["profile"]) if s["profile"] in names else -1,
+            "list": names, "lora": s["lora"]}
 
 @app.route("/api/profile", methods=["GET", "POST"])
 def api_profile():
-    if request.method == "GET":
-        return jsonify(profile_state())
-    data = request.json or {}
-    action = (data.get("action") or "").strip().lower()
-    if action == "cycle":
-        name = cycle_profile()
-    elif action == "set":
-        name = set_active_profile((data.get("name") or "").strip())
-    else:
-        return jsonify({"error": "unknown action"}), 400
-    print(f"[PROFILE] → {name}")
-    return jsonify(profile_state())
+    s = session()
+    if request.method == "POST":
+        data = request.json or {}
+        action = (data.get("action") or "").strip().lower()
+        if action == "cycle":
+            cycle_profile(s)
+        elif action == "set":
+            name = (data.get("name") or "").strip()
+            if name in visible_profiles(s):
+                s["profile"] = name
+        else:
+            return jsonify({"error": "unknown action"}), 400
+        print(f"[PROFILE] {s['ip']} → {s['profile']}")
+    return jsonify(profile_state(s))
 
 @app.route("/api/chat", methods=["POST"])
 def api_chat():
     data = request.json or {}
     user_message = (data.get("message") or "").strip()
+    sess = session()
+    check_unlock(user_message, sess)   # chat text goes to the LLM unchanged
     lower = user_message.lower()
     if lower in ("/lora", "/lora cycle", "lora cycle"):
-        return jsonify({"reply": f"LoRA → {cycle_lora()}", "lora": current_lora_name()})
+        return jsonify({"reply": f"LoRA → {cycle_lora(sess)}", "lora": sess["lora"]})
     if lower in ("/lora clear", "lora clear", "/lora none"):
-        return jsonify({"reply": f"LoRA → {clear_lora()}", "lora": current_lora_name()})
+        return jsonify({"reply": f"LoRA → {clear_lora(sess)}", "lora": sess["lora"]})
     if not user_message:
         return jsonify({"error": "Empty message", "lora": current_lora_name()}), 400
 
@@ -568,13 +664,15 @@ def api_image():
     Failure → small JSON error.
     """
     data = request.json or {}
-    prompt = (data.get("prompt") or "").strip()
+    sess = session()
+    prompt = check_unlock((data.get("prompt") or "").strip(), sess)
+    # Only what this device is allowed to see; otherwise its own selection
     profile_name = (data.get("profile") or "").strip()
-    if not profiles.get(profile_name):
-        profile_name = profiles.active_name()
+    if profile_name not in visible_profiles(sess):
+        profile_name = sess["profile"]
     selected = (data.get("lora") or "").strip()
-    if not selected and active_lora_idx >= 0:
-        selected = current_lora_name()
+    if selected not in visible_loras(sess):
+        selected = sess["lora"]
     if selected == "None":
         selected = ""
     if not prompt:
@@ -592,13 +690,13 @@ def api_image():
         if not rgb565:
             return jsonify({"error": last_image_error or "Image generation failed",
                             "lora": current_lora_name()}), 500
-        print(f"[IMG] {len(rgb565)} rgb565 bytes, profile={profile_name}, lora={current_lora_name()}")
+        print(f"[IMG] {len(rgb565)} rgb565 bytes, profile={profile_name}, lora={selected or 'None'}")
         return Response(
             rgb565,
             mimetype="application/octet-stream",
             headers={
                 "Content-Length": str(len(rgb565)),
-                "X-Lora": current_lora_name(),
+                "X-Lora": selected or "None",
                 "X-Profile": profile_name,
                 "X-Width": "320",
                 "X-Height": "240",
@@ -615,7 +713,7 @@ class Core2ServerGUI:
     def __init__(self, root):
         self.root = root
         self.root.title("MantisKAI – PC Bridge")
-        self.root.geometry("1000x820")
+        self.root.geometry("1120x880")
         self.root.configure(bg="#121212")
         style = ttk.Style()
         style.theme_use("clam")
@@ -652,7 +750,7 @@ class Core2ServerGUI:
         top.pack(fill=tk.X)
         self.status_label = ttk.Label(top, text="Checking LM Studio...", style="Header.TLabel")
         self.status_label.pack(side=tk.LEFT)
-        self.lora_label = ttk.Label(top, text=f"LoRA: {current_lora_name()}", style="Header.TLabel")
+        self.lora_label = ttk.Label(top, text=device_status_text(), style="Header.TLabel")
         self.lora_label.pack(side=tk.RIGHT)
         frame = ttk.Frame(self.chat_tab, padding=10)
         frame.pack(fill=tk.BOTH, expand=True)
@@ -673,14 +771,15 @@ class Core2ServerGUI:
         ttk.Button(lf, text="Cycle LoRA", command=self.gui_cycle).pack(side=tk.LEFT, padx=5)
         ttk.Button(lf, text="Clear LoRA", command=self.gui_clear).pack(side=tk.LEFT, padx=5)
 
+    # These act on the Core2 that talked to the server most recently
     def gui_cycle(self):
         name = cycle_lora()
-        self.lora_label.config(text=f"LoRA: {name}")
+        self.lora_label.config(text=device_status_text())
         self.log("SYSTEM", f"LoRA → {name}")
 
     def gui_clear(self):
         name = clear_lora()
-        self.lora_label.config(text=f"LoRA: {name}")
+        self.lora_label.config(text=device_status_text())
         self.log("SYSTEM", f"LoRA → {name}")
 
     def setup_image(self):
@@ -693,9 +792,10 @@ class Core2ServerGUI:
         self.img_profile_combo.grid(row=0, column=1, columnspan=2, padx=5)
         self.img_profile_combo.set(profiles.active_name())
         ttk.Label(ctrl, text="LoRA:").grid(row=0, column=3, padx=(20, 5))
-        self.lora_combo = ttk.Combobox(ctrl, values=["None"] + LORA_LIST, width=22, state="readonly")
+        self.lora_combo = ttk.Combobox(ctrl, values=["None"] + LORA_LIST + HIDDEN_LORA_LIST,
+                                       width=22, state="readonly")
         self.lora_combo.grid(row=0, column=4)
-        self.lora_combo.set(current_lora_name())
+        self.lora_combo.set("None")
         inp = ttk.Frame(pad)
         inp.pack(fill=tk.X, pady=(0, 10))
         ttk.Label(inp, text="Prompt:").pack(side=tk.LEFT, padx=(0, 8))
@@ -730,154 +830,240 @@ class Core2ServerGUI:
     # ------------------------------------------------------------------
     # Profiles tab: build, import (ComfyUI PNG / API JSON), edit and test
     # ------------------------------------------------------------------
+    NODE_NAMES = {
+        "CheckpointLoaderSimple": "Checkpoint", "CheckpointLoader": "Checkpoint",
+        "UNETLoader": "Diffusion model", "DualCLIPLoader": "Text encoders",
+        "CLIPLoader": "Text encoder", "TripleCLIPLoader": "Text encoders",
+        "VAELoader": "VAE", "LoraLoader": "LoRA", "LoraLoaderModelOnly": "LoRA (model only)",
+        "KSampler": "Sampler", "KSamplerAdvanced": "Sampler (advanced)",
+        "KSamplerSelect": "Sampler type", "BasicScheduler": "Scheduler",
+        "CFGGuider": "CFG guider", "FluxGuidance": "Flux guidance",
+        "CLIPSetLastLayer": "CLIP skip", "ModelSamplingFlux": "Flux model sampling",
+        "ModelSamplingDiscrete": "Model sampling", "LatentUpscale": "Hires: latent upscale",
+        "LatentUpscaleBy": "Hires: latent upscale",
+    }
+
     def setup_profiles(self):
         self.p_cur = None          # working copy being edited
         self.p_orig_name = None    # its name on disk; None = not saved yet
         self.p_notes = []
+        self.p_fields = []         # (node_id, input, kind, tk variable)
         self.p_photo = None
-        self.p_last_active = None
+        self.p_last_status = None
+        self.comfy_info = {}
 
         dark = dict(bg="#1e1e1e", fg="#ffffff", insertbackground="#ffffff",
                     relief=tk.FLAT, highlightthickness=1)
+        self.p_dark = dark
+        style = ttk.Style()
+        style.configure("TCombobox", fieldbackground="#1e1e1e", foreground="#ffffff",
+                        background="#2a2a2a", arrowcolor="#ffffff")
+        style.map("TCombobox", fieldbackground=[("readonly", "#1e1e1e")],
+                  foreground=[("readonly", "#ffffff")])
+        style.configure("TSpinbox", fieldbackground="#1e1e1e", foreground="#ffffff",
+                        arrowcolor="#ffffff")
+        style.configure("TCheckbutton", background="#121212", foreground="#ffffff")
+        style.configure("Node.TLabel", background="#1a1a1a", foreground="#00e0c0",
+                        font=("Arial", 10, "bold"))
+        style.configure("Card.TFrame", background="#1a1a1a")
+        style.configure("Card.TLabel", background="#1a1a1a", foreground="#ffffff")
+        style.configure("Small.TButton", font=("Arial", 9), padding=[6, 1])
+
         outer = ttk.Frame(self.profiles_tab, padding=10)
         outer.pack(fill=tk.BOTH, expand=True)
 
-        # ---- left: list + actions
-        left = ttk.Frame(outer)
+        # ---- left column: list, actions, test
+        left = ttk.Frame(outer, width=340)
         left.pack(side=tk.LEFT, fill=tk.Y)
         ttk.Label(left, text="Profiles (C button order)", style="Header.TLabel").pack(anchor=tk.W)
-        self.p_list = tk.Listbox(left, width=26, height=16, font=("Arial", 10),
+        self.p_list = tk.Listbox(left, width=40, height=9, font=("Arial", 10),
                                  bg="#1e1e1e", fg="#ffffff", selectbackground="#007373",
                                  exportselection=False, relief=tk.FLAT)
-        self.p_list.pack(fill=tk.Y, pady=(4, 8))
+        self.p_list.pack(fill=tk.X, pady=(4, 6))
         self.p_list.bind("<<ListboxSelect>>", self.p_on_select)
-        for text, cmd in (("New (basic)", self.p_new_basic),
-                          ("Import PNG / API JSON", self.p_import),
-                          ("Duplicate", self.p_duplicate),
-                          ("Delete", self.p_delete),
-                          ("Use on Core2", self.p_use_on_core2)):
-            ttk.Button(left, text=text, command=cmd).pack(fill=tk.X, pady=2)
-        self.p_active_label = ttk.Label(left, text="", wraplength=200)
-        self.p_active_label.pack(anchor=tk.W, pady=(8, 0))
+        btns = ttk.Frame(left)
+        btns.pack(fill=tk.X)
+        for i, (text, cmd) in enumerate((("New", self.p_new_basic),
+                                         ("Import PNG / JSON", self.p_import),
+                                         ("Duplicate", self.p_duplicate),
+                                         ("Delete", self.p_delete))):
+            ttk.Button(btns, text=text, command=cmd).grid(row=i // 2, column=i % 2, sticky=tk.EW,
+                                                          padx=2, pady=2)
+        btns.columnconfigure(0, weight=1)
+        btns.columnconfigure(1, weight=1)
+        ttk.Button(left, text="Make default for new Core2 sessions",
+                   command=self.p_use_on_core2).pack(fill=tk.X, pady=(2, 0))
+        self.p_active_label = ttk.Label(left, text="", wraplength=330)
+        self.p_active_label.pack(anchor=tk.W, pady=(4, 8))
 
-        # ---- right: editor
+        ttk.Label(left, text="Test (uses unsaved edits):", style="Header.TLabel").pack(anchor=tk.W)
+        self.p_test_prompt = tk.Entry(left, font=("Arial", 10), **dark)
+        self.p_test_prompt.pack(fill=tk.X, ipady=3, pady=2)
+        self.p_test_prompt.insert(0, "a mantis wearing headphones")
+        self.p_test_prompt.bind("<Return>", lambda e: self.p_test())
+        trow = ttk.Frame(left)
+        trow.pack(fill=tk.X, pady=2)
+        ttk.Label(trow, text="+ Core2 LoRA:").pack(side=tk.LEFT)
+        self.p_lora_combo = ttk.Combobox(trow, values=["None"] + LORA_LIST + HIDDEN_LORA_LIST,
+                                         width=22, state="readonly")
+        self.p_lora_combo.set("None")
+        self.p_lora_combo.pack(side=tk.LEFT, padx=4)
+        ttk.Button(trow, text="Test", command=self.p_test).pack(side=tk.RIGHT)
+        self.p_img = tk.Label(left, text="320x240 preview\n(what the Core2 shows)",
+                              width=320, height=240, bg="#000000", fg="#777777")
+        self.p_img.pack(pady=(6, 4), anchor=tk.W)
+        self.p_status = ttk.Label(left, text="", wraplength=330)
+        self.p_status.pack(anchor=tk.W)
+
+        # ---- right column: editor
         right = ttk.Frame(outer)
-        right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(12, 0))
+        right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(14, 0))
 
         form = ttk.Frame(right)
         form.pack(fill=tk.X)
         form.columnconfigure(1, weight=1)
         ttk.Label(form, text="Name:").grid(row=0, column=0, sticky=tk.W, pady=2)
         self.p_name = tk.Entry(form, font=("Arial", 10), **dark)
-        self.p_name.grid(row=0, column=1, columnspan=4, sticky=tk.EW, pady=2, ipady=2)
+        self.p_name.grid(row=0, column=1, sticky=tk.EW, pady=2, ipady=2)
+        self.p_hidden_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(form, text="Hidden (needs the keyword)", variable=self.p_hidden_var
+                        ).grid(row=0, column=2, sticky=tk.W, padx=(10, 0))
         ttk.Label(form, text="Prompt template:").grid(row=1, column=0, sticky=tk.W, pady=2)
         self.p_template = tk.Entry(form, font=("Arial", 10), **dark)
-        self.p_template.grid(row=1, column=1, columnspan=4, sticky=tk.EW, pady=2, ipady=2)
-        ttk.Label(form, text="{prompt} is replaced by what you type or say on the Core2",
-                  font=("Arial", 8)).grid(row=2, column=1, columnspan=4, sticky=tk.W)
-        ttk.Label(form, text="Negative:").grid(row=3, column=0, sticky=tk.W, pady=2)
+        self.p_template.grid(row=1, column=1, columnspan=2, sticky=tk.EW, pady=2, ipady=2)
+        ttk.Label(form, text="words before  {prompt}  words after   ({prompt} = what the Core2 sends)",
+                  font=("Arial", 8)).grid(row=2, column=1, columnspan=2, sticky=tk.W)
+        ttk.Label(form, text="Negative prompt:").grid(row=3, column=0, sticky=tk.W, pady=2)
         self.p_negative = tk.Entry(form, font=("Arial", 10), **dark)
-        self.p_negative.grid(row=3, column=1, columnspan=4, sticky=tk.EW, pady=2, ipady=2)
-        ttk.Label(form, text="Size (always 1 image):").grid(row=4, column=0, sticky=tk.W, pady=2)
-        self.p_width = tk.Entry(form, width=6, font=("Arial", 10), **dark)
-        self.p_width.grid(row=4, column=1, sticky=tk.W, pady=2, ipady=2)
-        ttk.Label(form, text="x").grid(row=4, column=2, sticky=tk.W, padx=4)
-        self.p_height = tk.Entry(form, width=6, font=("Arial", 10), **dark)
-        self.p_height.grid(row=4, column=3, sticky=tk.W, pady=2, ipady=2)
-        ttk.Label(form, text="4:3 fits the screen; 640x480 for SD1.5, 1024x768 for SDXL/Flux",
-                  font=("Arial", 8)).grid(row=4, column=4, sticky=tk.W, padx=8)
+        self.p_negative.grid(row=3, column=1, columnspan=2, sticky=tk.EW, pady=2, ipady=2)
+        size = ttk.Frame(form)
+        size.grid(row=4, column=1, columnspan=2, sticky=tk.W, pady=2)
+        ttk.Label(form, text="Size:").grid(row=4, column=0, sticky=tk.W, pady=2)
+        self.p_width = tk.Entry(size, width=6, font=("Arial", 10), **dark)
+        self.p_width.pack(side=tk.LEFT, ipady=2)
+        ttk.Label(size, text=" x ").pack(side=tk.LEFT)
+        self.p_height = tk.Entry(size, width=6, font=("Arial", 10), **dark)
+        self.p_height.pack(side=tk.LEFT, ipady=2)
+        ttk.Label(size, text="   always 1 image. 640x480 SD1.5, 1024x768 SDXL/Flux",
+                  font=("Arial", 8)).pack(side=tk.LEFT)
+        src = ttk.Frame(form)
+        src.grid(row=5, column=0, columnspan=3, sticky=tk.EW, pady=(4, 0))
+        self.p_source_label = ttk.Label(src, text="", font=("Arial", 8), wraplength=520)
+        self.p_source_label.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Button(src, text="Use image prompt as template", style="Small.TButton",
+                   command=self.p_use_source).pack(side=tk.RIGHT)
 
-        src = ttk.Frame(right)
-        src.pack(fill=tk.X, pady=(6, 0))
-        ttk.Label(src, text="Prompt in the imported image:").pack(side=tk.LEFT)
-        ttk.Button(src, text="Use as template", command=self.p_use_source).pack(side=tk.RIGHT)
-        self.p_source = scrolledtext.ScrolledText(right, height=2, wrap=tk.WORD, font=("Arial", 9),
-                                                  bg="#1e1e1e", fg="#bbbbbb", borderwidth=0)
-        self.p_source.pack(fill=tk.X, pady=(2, 6))
+        bar = ttk.Frame(right)
+        bar.pack(fill=tk.X, pady=(10, 4))
+        ttk.Label(bar, text="Workflow settings", style="Header.TLabel").pack(side=tk.LEFT)
+        ttk.Button(bar, text="+ Add LoRA", command=self.p_add_lora).pack(side=tk.LEFT, padx=10)
+        ttk.Button(bar, text="Reload lists from ComfyUI", style="Small.TButton",
+                   command=self.p_fetch_comfy).pack(side=tk.RIGHT)
+        self.p_comfy_label = ttk.Label(right, text="", font=("Arial", 8))
+        self.p_comfy_label.pack(anchor=tk.W)
 
-        ttk.Label(right, text="What the server does with this workflow:").pack(anchor=tk.W)
-        self.p_report = scrolledtext.ScrolledText(right, height=7, wrap=tk.WORD, font=("Consolas", 9),
-                                                  bg="#1e1e1e", fg="#00ff00", borderwidth=0)
-        self.p_report.pack(fill=tk.X, pady=(2, 6))
+        # scrollable node cards
+        wrap = ttk.Frame(right)
+        wrap.pack(fill=tk.BOTH, expand=True)
+        self.p_canvas = tk.Canvas(wrap, bg="#121212", highlightthickness=0)
+        vsb = ttk.Scrollbar(wrap, orient=tk.VERTICAL, command=self.p_canvas.yview)
+        self.p_canvas.configure(yscrollcommand=vsb.set)
+        vsb.pack(side=tk.RIGHT, fill=tk.Y)
+        self.p_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.p_inner = ttk.Frame(self.p_canvas)
+        self.p_inner_id = self.p_canvas.create_window((0, 0), window=self.p_inner, anchor=tk.NW)
+        self.p_inner.bind("<Configure>", lambda e: self.p_canvas.configure(
+            scrollregion=self.p_canvas.bbox("all")))
+        self.p_canvas.bind("<Configure>", lambda e: self.p_canvas.itemconfigure(
+            self.p_inner_id, width=e.width))
+        def wheel(e):
+            delta = -1 if (getattr(e, "num", 0) == 4 or e.delta > 0) else 1
+            self.p_canvas.yview_scroll(delta, "units")
+        def bind_wheel(_e):
+            self.p_canvas.bind_all("<MouseWheel>", wheel)
+            self.p_canvas.bind_all("<Button-4>", wheel)
+            self.p_canvas.bind_all("<Button-5>", wheel)
+        def unbind_wheel(_e):
+            self.p_canvas.unbind_all("<MouseWheel>")
+            self.p_canvas.unbind_all("<Button-4>")
+            self.p_canvas.unbind_all("<Button-5>")
+        self.p_canvas.bind("<Enter>", bind_wheel)
+        self.p_canvas.bind("<Leave>", unbind_wheel)
 
-        bottom = ttk.Frame(right)
-        bottom.pack(fill=tk.BOTH, expand=True)
-
-        # node settings (left of bottom)
-        nodes = ttk.Frame(bottom)
-        nodes.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        ttk.Label(nodes, text="Node settings (sampler, steps, cfg, models...):").pack(anchor=tk.W)
-        cols = ("node", "class", "input", "value")
-        tree_wrap = ttk.Frame(nodes)
-        tree_wrap.pack(fill=tk.BOTH, expand=True)
-        self.p_tree = ttk.Treeview(tree_wrap, columns=cols, show="headings", height=9)
-        for c, w in zip(cols, (60, 150, 110, 200)):
-            self.p_tree.heading(c, text=c)
-            self.p_tree.column(c, width=w, stretch=(c == "value"))
-        sb = ttk.Scrollbar(tree_wrap, orient=tk.VERTICAL, command=self.p_tree.yview)
-        self.p_tree.configure(yscrollcommand=sb.set)
-        self.p_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        sb.pack(side=tk.RIGHT, fill=tk.Y)
-        self.p_tree.bind("<<TreeviewSelect>>", self.p_on_tree_select)
-        edit = ttk.Frame(nodes)
-        edit.pack(fill=tk.X, pady=(4, 0))
-        self.p_value = tk.Entry(edit, font=("Arial", 10), **dark)
-        self.p_value.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=2, padx=(0, 6))
-        self.p_value.bind("<Return>", lambda e: self.p_set_value())
-        ttk.Button(edit, text="Set value", command=self.p_set_value).pack(side=tk.LEFT)
-        ttk.Button(nodes, text="Save profile", command=self.p_save).pack(anchor=tk.E, pady=(8, 0))
-
-        # test panel (right of bottom)
-        test = ttk.Frame(bottom)
-        test.pack(side=tk.LEFT, fill=tk.Y, padx=(12, 0))
-        ttk.Label(test, text="Test (uses the unsaved edits too):").pack(anchor=tk.W)
-        self.p_test_prompt = tk.Entry(test, width=40, font=("Arial", 10), **dark)
-        self.p_test_prompt.pack(fill=tk.X, ipady=3, pady=2)
-        self.p_test_prompt.insert(0, "a mantis wearing headphones")
-        self.p_test_prompt.bind("<Return>", lambda e: self.p_test())
-        trow = ttk.Frame(test)
-        trow.pack(fill=tk.X, pady=2)
-        ttk.Label(trow, text="LoRA:").pack(side=tk.LEFT)
-        self.p_lora_combo = ttk.Combobox(trow, values=["None"] + LORA_LIST, width=20, state="readonly")
-        self.p_lora_combo.set("None")
-        self.p_lora_combo.pack(side=tk.LEFT, padx=4)
-        ttk.Button(trow, text="Test", command=self.p_test).pack(side=tk.RIGHT)
-        self.p_img = tk.Label(test, text="320x240 preview\n(what the Core2 shows)",
-                              width=320, height=240, bg="#000000", fg="#777777")
-        self.p_img.pack(pady=(6, 4))
-        self.p_status = ttk.Label(test, text="", wraplength=320)
-        self.p_status.pack(anchor=tk.W)
+        self.p_report = ttk.Label(right, text="", font=("Consolas", 8), wraplength=620,
+                                  foreground="#00ff00")
+        self.p_report.pack(anchor=tk.W, fill=tk.X, pady=(6, 0))
+        ttk.Button(right, text="Save profile", command=self.p_save).pack(anchor=tk.E, pady=(6, 0))
 
         self.refresh_profile_lists()
         active = profiles.active_name()
         if active:
             self.p_load(profiles.get(active), active)
+        self.p_fetch_comfy()
         self.root.after(2000, self.p_poll)
+
+    # ---- ComfyUI model / sampler lists
+    def p_fetch_comfy(self):
+        self.p_comfy_label.config(text=f"Loading model lists from ComfyUI at {COMFY_URL}...")
+        def work():
+            try:
+                info = mp.fetch_object_info(COMFY_URL)
+                def done():
+                    self.comfy_info = info
+                    n_ckpt = len(mp.input_choices(info, "CheckpointLoaderSimple", "ckpt_name") or [])
+                    n_lora = len(mp.input_choices(info, "LoraLoader", "lora_name") or [])
+                    self.p_comfy_label.config(
+                        text=f"ComfyUI: {n_ckpt} checkpoints, {n_lora} LoRAs available.")
+                    if self.p_cur:
+                        self.p_collect_fields(quiet=True)
+                        self.p_build_form()
+                self.root.after(0, done)
+            except Exception as e:
+                msg = str(e)
+                self.root.after(0, lambda: self.p_comfy_label.config(
+                    text=f"ComfyUI not reachable ({msg}). Names can still be typed; "
+                         f"start ComfyUI and press Reload for dropdown lists."))
+        threading.Thread(target=work, daemon=True).start()
+
+    def p_choices(self, cls, key, current):
+        vals = mp.input_choices(self.comfy_info, cls, key)
+        if vals is None and key in ("lora_name",):
+            vals = mp.input_choices(self.comfy_info, "LoraLoader", "lora_name")
+        if vals is None:
+            return None
+        if current not in vals:
+            vals = [str(current)] + vals
+        return vals
 
     # ---- list / state
     def refresh_profile_lists(self, select=None):
-        names = profiles.names()
-        active = profiles.active_name()
+        entries = profiles.entries()
+        names = [n for n, _ in entries]
+        default = profiles.active_name()
         self.p_list.delete(0, tk.END)
-        for n in names:
-            self.p_list.insert(tk.END, ("▶ " if n == active else "   ") + n)
+        for n, hidden in entries:
+            mark = "▶ " if n == default else "   "
+            self.p_list.insert(tk.END, mark + n + ("   (hidden)" if hidden else ""))
         target = select or self.p_orig_name
         if target in names:
             i = names.index(target)
             self.p_list.selection_clear(0, tk.END)
             self.p_list.selection_set(i)
             self.p_list.see(i)
-        self.p_active_label.config(text=f"Core2 is using: {active or 'none'}")
+        self.p_active_label.config(text=f"Default for new sessions: {default or 'none'}\n"
+                                        f"{device_status_text()}")
         self.img_profile_combo.config(values=names)
         if self.img_profile_combo.get() not in names:
-            self.img_profile_combo.set(active)
-        self.p_last_active = active
+            self.img_profile_combo.set(default)
 
     def p_poll(self):
-        # The Core2 can change the active profile/LoRA at any time
-        if profiles.active_name() != self.p_last_active:
-            self.refresh_profile_lists()
-        self.lora_label.config(text=f"LoRA: {current_lora_name()}")
+        # The Core2 changes its profile / LoRA at any time
+        status = device_status_text()
+        if status != self.p_last_status:
+            self.p_last_status = status
+            self.lora_label.config(text=status)
+            self.p_active_label.config(text=f"Default for new sessions: "
+                                            f"{profiles.active_name() or 'none'}\n{status}")
         self.root.after(2000, self.p_poll)
 
     def p_discard_ok(self):
@@ -910,33 +1096,126 @@ class Core2ServerGUI:
                            (self.p_height, str(profile.get("height", 480)))):
             entry.delete(0, tk.END)
             entry.insert(0, val)
-        self.p_source.config(state=tk.NORMAL)
-        self.p_source.delete("1.0", tk.END)
-        self.p_source.insert(tk.END, profile.get("source_prompt", "") or "(none)")
-        self.p_source.config(state=tk.DISABLED)
-        self.p_fill_tree()
-        self.p_refresh_report()
+        self.p_hidden_var.set(bool(profile.get("hidden")))
+        src = (profile.get("source_prompt") or "").replace("\n", " ").strip()
+        self.p_source_label.config(text=f"Image prompt: {src[:220]}" if src else "")
+        self.p_build_form()
         self.p_status.config(text="" if orig_name else "Not saved yet.")
 
-    def p_fill_tree(self):
-        self.p_tree.delete(*self.p_tree.get_children())
+    def p_node_order(self, nid):
+        cls = self.p_cur["workflow"][nid]["class_type"]
+        if mp.is_lora_node(self.p_cur["workflow"][nid]):
+            rank = 1
+        elif "Loader" in cls:
+            rank = 0
+        elif any(k in cls for k in ("Sampler", "Scheduler", "Guider", "Guidance")):
+            rank = 2
+        else:
+            rank = 3
+        return (rank, int(nid) if nid.isdigit() else 10**9, nid)
+
+    def p_build_form(self):
+        for w in self.p_inner.winfo_children():
+            w.destroy()
+        self.p_fields = []
         wf = self.p_cur["workflow"]
-        def key(nid):
-            return (0, int(nid), "") if nid.isdigit() else (1, 0, nid)
-        for nid in sorted(wf, key=key):
+        managed = mp.managed_inputs(self.p_cur)
+        shown = 0
+        for nid in sorted(wf, key=self.p_node_order):
             node = wf[nid]
-            for k, v in node["inputs"].items():
-                if mp.is_link(v) or isinstance(v, (dict, list)):
+            cls = node["class_type"]
+            keys = [k for k, v in node["inputs"].items()
+                    if (nid, k) not in managed and not mp.is_link(v)
+                    and not isinstance(v, (dict, list)) and v is not None]
+            is_lora = mp.is_lora_node(node)
+            if not keys and not is_lora:
+                continue
+            shown += 1
+            card = ttk.Frame(self.p_inner, style="Card.TFrame", padding=(8, 6))
+            card.pack(fill=tk.X, pady=3, padx=(0, 4))
+            card.columnconfigure(1, weight=1)
+            title = self.NODE_NAMES.get(cls, cls)
+            meta = (node.get("_meta") or {}).get("title")
+            if meta and meta not in (cls, title):
+                title += f" - {meta}"
+            ttk.Label(card, text=f"{title}   (node {nid})", style="Node.TLabel"
+                      ).grid(row=0, column=0, columnspan=2, sticky=tk.W)
+            if is_lora:
+                ttk.Button(card, text="Remove", style="Small.TButton",
+                           command=lambda n=nid: self.p_remove_lora(n)
+                           ).grid(row=0, column=2, sticky=tk.E)
+            for r, k in enumerate(keys, start=1):
+                self.p_add_field(card, r, nid, cls, k, node["inputs"][k])
+        if not shown:
+            ttk.Label(self.p_inner, text="No adjustable settings in this workflow.").pack(anchor=tk.W)
+        self.p_refresh_report()
+
+    def p_add_field(self, card, row, nid, cls, key, val):
+        ttk.Label(card, text=key.replace("_", " "), style="Card.TLabel"
+                  ).grid(row=row, column=0, sticky=tk.W, padx=(0, 10), pady=1)
+        if isinstance(val, bool):
+            var = tk.BooleanVar(value=val)
+            ttk.Checkbutton(card, variable=var).grid(row=row, column=1, sticky=tk.W)
+            self.p_fields.append((nid, key, "bool", var))
+            return
+        var = tk.StringVar(value=str(val))
+        choices = self.p_choices(cls, key, val) if isinstance(val, str) else None
+        if choices is not None:
+            w = ttk.Combobox(card, textvariable=var, values=choices, state="readonly", width=48)
+            w.grid(row=row, column=1, sticky=tk.EW, pady=1)
+            self.p_fields.append((nid, key, "str", var))
+            return
+        if isinstance(val, (int, float)):
+            rng = mp.input_range(self.comfy_info, cls, key)
+            lo, hi, step = rng if rng else (None, None, None)
+            is_int = isinstance(val, int)
+            step = step or (1 if is_int else 0.05)
+            lo = -1e9 if lo is None else lo
+            hi = 1e9 if hi is None else hi
+            w = ttk.Spinbox(card, textvariable=var, from_=lo, to=hi, increment=step, width=12,
+                            format="%.0f" if is_int else "%.2f")
+            var.set(str(val))
+            w.grid(row=row, column=1, sticky=tk.W, pady=1)
+            hint = f"{lo:g} to {hi:g}" if rng and rng[0] is not None and rng[1] is not None else ""
+            if hint:
+                ttk.Label(card, text=hint, style="Card.TLabel", font=("Arial", 8)
+                          ).grid(row=row, column=2, sticky=tk.W, padx=6)
+            self.p_fields.append((nid, key, "int" if is_int else "float", var))
+            return
+        w = tk.Entry(card, textvariable=var, font=("Arial", 10), **self.p_dark)
+        w.grid(row=row, column=1, columnspan=2, sticky=tk.EW, pady=1, ipady=2)
+        self.p_fields.append((nid, key, "str", var))
+
+    def p_collect_fields(self, quiet=False):
+        """Write the form values back into the working workflow."""
+        wf = self.p_cur["workflow"]
+        for nid, key, kind, var in self.p_fields:
+            if nid not in wf:
+                continue
+            raw = var.get()
+            try:
+                if kind == "bool":
+                    val = bool(raw)
+                elif kind == "int":
+                    val = int(float(str(raw).strip()))
+                elif kind == "float":
+                    val = float(str(raw).strip())
+                else:
+                    val = str(raw)
+            except ValueError:
+                if quiet:
                     continue
-                self.p_tree.insert("", tk.END, iid=f"{nid}\x1f{k}",
-                                   values=(nid, node["class_type"], k, str(v)))
+                raise ValueError(f"Node {nid} '{key}' needs a number (got '{raw}').")
+            wf[nid]["inputs"][key] = val
 
     def p_collect(self):
-        """Profile from the editor fields (raises ValueError on bad size)."""
+        """Full profile from the editor (raises ValueError on bad input)."""
+        self.p_collect_fields()
         p = dict(self.p_cur)
         p["name"] = self.p_name.get().strip()
         p["template"] = self.p_template.get().strip() or "{prompt}"
         p["negative"] = self.p_negative.get().strip()
+        p["hidden"] = bool(self.p_hidden_var.get())
         w, h = int(self.p_width.get()), int(self.p_height.get())
         if not (64 <= w <= 2048 and 64 <= h <= 2048):
             raise ValueError("Size must be between 64 and 2048.")
@@ -945,42 +1224,11 @@ class Core2ServerGUI:
 
     def p_refresh_report(self):
         text = mp.describe(self.p_cur)
+        keep = [l for l in text.splitlines() if l.startswith(("Prompt goes", "Negative goes",
+                                                              "LoRA", "Size forced"))]
         if self.p_notes:
-            text += "\n\nImport changes:\n- " + "\n- ".join(self.p_notes)
-        self.p_report.config(state=tk.NORMAL)
-        self.p_report.delete("1.0", tk.END)
-        self.p_report.insert(tk.END, text)
-        self.p_report.config(state=tk.DISABLED)
-
-    def p_on_tree_select(self, _event=None):
-        sel = self.p_tree.selection()
-        if not sel:
-            return
-        self.p_value.delete(0, tk.END)
-        self.p_value.insert(0, self.p_tree.item(sel[0], "values")[3])
-
-    def p_set_value(self):
-        sel = self.p_tree.selection()
-        if not sel or not self.p_cur:
-            return
-        nid, k = sel[0].split("\x1f", 1)
-        inputs = self.p_cur["workflow"][nid]["inputs"]
-        old, raw = inputs[k], self.p_value.get()
-        try:
-            if isinstance(old, bool):
-                new = raw.strip().lower() in ("1", "true", "yes", "on")
-            elif isinstance(old, int):
-                new = int(raw)
-            elif isinstance(old, float):
-                new = float(raw)
-            else:
-                new = raw
-        except ValueError:
-            messagebox.showerror("Bad value", f"{k} needs a {type(old).__name__}.")
-            return
-        inputs[k] = new
-        self.p_tree.item(sel[0], values=(nid, self.p_cur["workflow"][nid]["class_type"], k, str(new)))
-        self.p_refresh_report()
+            keep.append("Import: " + " ".join(self.p_notes))
+        self.p_report.config(text="\n".join(keep))
 
     def p_use_source(self):
         src = (self.p_cur or {}).get("source_prompt", "").strip()
@@ -989,14 +1237,44 @@ class Core2ServerGUI:
         self.p_template.delete(0, tk.END)
         self.p_template.insert(0, "{prompt}, " + src.replace("\n", " "))
 
+    # ---- LoRAs inside the profile
+    def p_add_lora(self):
+        if not self.p_cur:
+            return
+        try:
+            self.p_collect_fields()
+        except ValueError as e:
+            messagebox.showerror("Bad value", str(e))
+            return
+        choices = mp.input_choices(self.comfy_info, "LoraLoader", "lora_name") or []
+        name = choices[0] if choices else (LORA_LIST[0] if LORA_LIST else "")
+        try:
+            mp.add_profile_lora(self.p_cur["workflow"], name, 1.0)
+        except mp.ProfileError as e:
+            messagebox.showerror("Can't add LoRA", str(e))
+            return
+        self.p_build_form()
+        self.p_canvas.update_idletasks()
+        self.p_status.config(text="LoRA added. Pick it in the list and set its strength.")
+
+    def p_remove_lora(self, nid):
+        try:
+            self.p_collect_fields()
+        except ValueError as e:
+            messagebox.showerror("Bad value", str(e))
+            return
+        mp.remove_lora_node(self.p_cur["workflow"], nid)
+        self.p_build_form()
+
     # ---- actions
     def p_new_basic(self):
         if not self.p_discard_ok():
             return
-        p = mp.basic_profile("New profile", REALISTIC_MODEL,
-                             HARDCODED_POSITIVE_PREFIX + "{prompt}", HARDCODED_NEGATIVE)
-        self.p_load(p, None, ["Basic txt2img. Set the checkpoint in node 4 (ckpt_name) "
-                              "and the sampler settings in node 3, then save."])
+        ckpts = mp.input_choices(self.comfy_info, "CheckpointLoaderSimple", "ckpt_name") or []
+        ckpt = ckpts[0] if ckpts else REALISTIC_MODEL
+        p = mp.basic_profile("New profile", ckpt, "{prompt}", HARDCODED_NEGATIVE)
+        self.p_load(p, None, ["New text-to-image profile: pick the checkpoint and sampler "
+                              "settings below, add LoRAs if you want, then save."])
 
     def p_import(self):
         if not self.p_discard_ok():
@@ -1025,7 +1303,7 @@ class Core2ServerGUI:
         try:
             p = self.p_collect()
         except ValueError as e:
-            messagebox.showerror("Bad size", str(e))
+            messagebox.showerror("Bad value", str(e))
             return
         p = json.loads(json.dumps({k: v for k, v in p.items() if not k.startswith("_")}))
         p["name"] = p["name"] + " copy"
@@ -1037,7 +1315,7 @@ class Core2ServerGUI:
         try:
             p = self.p_collect()
         except ValueError as e:
-            messagebox.showerror("Bad size", str(e))
+            messagebox.showerror("Bad value", str(e))
             return
         if not p["name"]:
             messagebox.showerror("Name needed", "Give the profile a name.")
@@ -1056,9 +1334,9 @@ class Core2ServerGUI:
         self.p_cur = profiles.get(p["name"])
         self.p_notes = []
         self.refresh_profile_lists(select=p["name"])
-        self.p_refresh_report()
+        self.p_build_form()
         self.p_status.config(text="Saved.")
-        self.log("SYSTEM", f"Profile saved: {p['name']}")
+        self.log("SYSTEM", f"Profile saved: {p['name']}" + (" (hidden)" if p.get("hidden") else ""))
 
     def p_delete(self):
         if self.p_orig_name is None:
@@ -1081,11 +1359,11 @@ class Core2ServerGUI:
 
     def p_use_on_core2(self):
         if self.p_orig_name is None:
-            messagebox.showinfo("Save first", "Save the profile before using it on the Core2.")
+            messagebox.showinfo("Save first", "Save the profile first.")
             return
         set_active_profile(self.p_orig_name)
         self.refresh_profile_lists(select=self.p_orig_name)
-        self.log("SYSTEM", f"Core2 profile → {self.p_orig_name}")
+        self.log("SYSTEM", f"Default profile → {self.p_orig_name}")
 
     def p_test(self):
         if not self.p_cur:
@@ -1096,7 +1374,7 @@ class Core2ServerGUI:
         try:
             profile = self.p_collect()
         except ValueError as e:
-            messagebox.showerror("Bad size", str(e))
+            messagebox.showerror("Bad value", str(e))
             return
         sel = self.p_lora_combo.get()
         lora = "" if sel == "None" else sel
@@ -1106,7 +1384,7 @@ class Core2ServerGUI:
             global _gpu_busy
             if not _gpu_lock.acquire(blocking=False):
                 self.root.after(0, lambda: self.p_status.config(
-                    text="Busy: the Core2 or chat is using the GPU. Try again in a moment."))
+                    text="Busy: a Core2 or chat is using the GPU. Try again in a moment."))
                 return
             _gpu_busy = True
             t0 = time.time()
@@ -1169,6 +1447,14 @@ class Core2ServerGUI:
         self.comfy_entry.insert(0, COMFY_URL)
         self.voice_entry = row(9, "Piper voice path:")
         self.voice_entry.insert(0, TTS_VOICE_PATH)
+        self.hidden_lora_entry = row(10, "Hidden LoRA list (comma-sep):")
+        self.hidden_lora_entry.insert(0, ", ".join(HIDDEN_LORA_LIST))
+        self.keyword_entry = row(11, "Keyword for hidden options:")
+        self.keyword_entry.insert(0, HIDDEN_KEYWORD)
+        ttk.Label(pad, text="Saying or typing the keyword in a Core2 prompt adds hidden profiles and "
+                            "hidden LoRAs to that device's C/B rotation until it reboots or "
+                            "reconnects. Other devices stay locked. Leave empty to disable.",
+                  wraplength=760, font=("Arial", 8)).pack(anchor=tk.W)
 
         ttk.Button(pad, text="Save & Apply Settings", command=self.apply).pack(anchor=tk.E, pady=12)
 
@@ -1177,6 +1463,7 @@ class Core2ServerGUI:
         global REALISTIC_MODEL, ANIME_MODEL, LORA_LIST, LORA_STRENGTH
         global HARDCODED_POSITIVE_PREFIX, HARDCODED_NEGATIVE, COMFY_URL
         global TTS_VOICE_PATH, llm_voice, llm_sample_rate
+        global HIDDEN_LORA_LIST, HIDDEN_KEYWORD
 
         update_system_prompt(self.prompt_text.get("1.0", tk.END).strip())
         API_BASE_URL = self.api_entry.get().strip()
@@ -1192,6 +1479,8 @@ class Core2ServerGUI:
         HARDCODED_NEGATIVE = self.negative_entry.get().strip() or DEFAULT_CONFIG["comfy_negative"]
         COMFY_URL = self.comfy_entry.get().strip()
         TTS_VOICE_PATH = self.voice_entry.get().strip()
+        HIDDEN_LORA_LIST = [x.strip() for x in self.hidden_lora_entry.get().split(",") if x.strip()]
+        HIDDEN_KEYWORD = self.keyword_entry.get().strip()
 
         client = OpenAI(base_url=API_BASE_URL, api_key=USER_API_KEY)
 
@@ -1213,11 +1502,14 @@ class Core2ServerGUI:
         config["lora_strength"] = LORA_STRENGTH
         config["comfy_prefix"] = HARDCODED_POSITIVE_PREFIX
         config["comfy_negative"] = HARDCODED_NEGATIVE
+        config["hidden_lora_list"] = ", ".join(HIDDEN_LORA_LIST)
+        config["hidden_keyword"] = HIDDEN_KEYWORD
+        config["comfy_url"] = COMFY_URL
         save_config(config)
 
-        self.lora_label.config(text=f"LoRA: {current_lora_name()}")
-        self.lora_combo.config(values=["None"] + LORA_LIST)
-        self.p_lora_combo.config(values=["None"] + LORA_LIST)
+        self.lora_label.config(text=device_status_text())
+        self.lora_combo.config(values=["None"] + LORA_LIST + HIDDEN_LORA_LIST)
+        self.p_lora_combo.config(values=["None"] + LORA_LIST + HIDDEN_LORA_LIST)
         self.log("SYSTEM", "Settings saved")
         messagebox.showinfo("OK", "Configuration applied")
 
@@ -1275,7 +1567,7 @@ if __name__ == "__main__":
         target=lambda: app.run(host="0.0.0.0", port=FLASK_PORT, debug=False, use_reloader=False),
         daemon=True).start()
     print(f"[*] Flask http://0.0.0.0:{FLASK_PORT}")
-    print(f"[*] LoRAs: {LORA_LIST}  active={current_lora_name()}")
+    print(f"[*] LoRAs: {LORA_LIST}  hidden: {len(HIDDEN_LORA_LIST)}  profiles: {profiles.names()}")
     if get_whisper():
         print("[*] Local Whisper ready")
     elif STT_API_BASE:
