@@ -465,9 +465,9 @@ def basic_profile(name, ckpt, template="{prompt}", negative="",
 # ------------------------------------------------------------------
 # Generation
 # ------------------------------------------------------------------
-def apply_lora(graph, info, lora_name, strength):
+def _insert_lora(graph, info, nid, lora_name, strength):
     root = info.get("model_root")
-    if not lora_name or not root:
+    if not root:
         return False
     clip = info.get("clip_root")
     if clip:
@@ -477,11 +477,96 @@ def apply_lora(graph, info, lora_name, strength):
     else:
         node = {"class_type": "LoraLoaderModelOnly", "inputs": {
             "lora_name": lora_name, "strength_model": float(strength), "model": list(root)}}
-    _rewire(graph, root, [LORA_NODE_ID, 0])
+    _rewire(graph, root, [nid, 0])
     if clip:
-        _rewire(graph, clip, [LORA_NODE_ID, 1])
-    graph[LORA_NODE_ID] = node
+        _rewire(graph, clip, [nid, 1])
+    graph[nid] = node
     return True
+
+
+def apply_lora(graph, info, lora_name, strength):
+    """The Core2's selected LoRA (B button), added for one generation."""
+    if not lora_name:
+        return False
+    return _insert_lora(graph, info, LORA_NODE_ID, lora_name, strength)
+
+
+def add_profile_lora(graph, lora_name, strength=1.0):
+    """Permanently add a LoRA to a profile's workflow. Returns the new node id."""
+    info = analyze(graph)
+    if not info.get("model_root"):
+        raise ProfileError("This workflow has no model loader to attach a LoRA to.")
+    nums = [int(n) for n in graph if n.isdigit()]
+    nid = str(max(nums) + 1 if nums else 1)
+    _insert_lora(graph, info, nid, lora_name, strength)
+    return nid
+
+
+def remove_lora_node(graph, nid):
+    """Take a LoRA node out and reconnect what it fed to what fed it."""
+    node = graph.pop(nid)
+    m = node["inputs"].get("model")
+    c = node["inputs"].get("clip")
+    if is_link(m):
+        _rewire(graph, [nid, 0], m)
+    if is_link(c):
+        _rewire(graph, [nid, 1], c)
+
+
+def is_lora_node(node):
+    return "lora" in node.get("class_type", "").lower() and "lora_name" in node.get("inputs", {})
+
+
+def managed_inputs(profile):
+    """(node, input) pairs the server fills in itself on every generation."""
+    a = analyze(profile)
+    out = set(a["positive"]) | set(a["negative"]) | set(a["seeds"])
+    for nid in a["latents"]:
+        out |= {(nid, "width"), (nid, "height"), (nid, "batch_size")}
+    if a["output"]:
+        out |= {(a["output"], k) for k in profile["workflow"].get(a["output"], {}).get("inputs", {})}
+    return out
+
+
+# ------------------------------------------------------------------
+# ComfyUI node info (model lists, sampler names, ranges)
+# ------------------------------------------------------------------
+def fetch_object_info(comfy_url, timeout=20):
+    raw = urllib.request.urlopen(f"http://{comfy_url}/object_info", timeout=timeout).read()
+    return json.loads(raw.decode("utf-8"))
+
+
+def _input_spec(object_info, cls, key):
+    node = (object_info or {}).get(cls) or {}
+    ins = node.get("input") or {}
+    for group in ("required", "optional"):
+        spec = (ins.get(group) or {}).get(key)
+        if spec is not None:
+            return spec if isinstance(spec, list) else [spec]
+    return None
+
+
+def input_choices(object_info, cls, key):
+    """List of allowed values (models, samplers...) or None."""
+    spec = _input_spec(object_info, cls, key)
+    if not spec:
+        return None
+    if isinstance(spec[0], list):
+        return [str(x) for x in spec[0]]
+    if spec[0] == "COMBO" and len(spec) > 1 and isinstance(spec[1], dict):
+        return [str(x) for x in spec[1].get("options", [])]
+    return None
+
+
+def input_range(object_info, cls, key):
+    """(min, max, step) for numbers, or None."""
+    spec = _input_spec(object_info, cls, key)
+    if not spec or len(spec) < 2 or not isinstance(spec[1], dict):
+        return None
+    o = spec[1]
+    if "min" not in o and "max" not in o:
+        return None
+    return o.get("min"), o.get("max"), o.get("step")
 
 
 def build_prompt_graph(profile, user_prompt, lora_name="", lora_strength=0.8):
@@ -619,6 +704,11 @@ class ProfileStore:
     def names(self):
         with self.lock:
             return [p["name"] for p in self.profiles]
+
+    def entries(self):
+        """[(name, hidden)] in cycle order."""
+        with self.lock:
+            return [(p["name"], bool(p.get("hidden"))) for p in self.profiles]
 
     def get(self, name):
         with self.lock:
