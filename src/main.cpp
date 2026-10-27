@@ -1348,6 +1348,7 @@ void fetchAndPlayTTS(const String& text) {
             delay(10);
             M5.update();
         }
+
         if (!hasMore || !prefetched) break;
 
         // Swap — next chunk already in nextBuf, play immediately
