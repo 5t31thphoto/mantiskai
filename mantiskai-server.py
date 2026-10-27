@@ -21,6 +21,7 @@ from PIL import Image, ImageTk
 import tkinter as tk
 from tkinter import scrolledtext, ttk, messagebox
 from flask import Flask, request, jsonify, Response
+from mantiskai_kasa import handle_kasa_chat, register_kasa_routes
 from openai import OpenAI
 
 try:
@@ -152,6 +153,8 @@ if PiperVoice:
         print(f"[TTS] load failed: {e}")
 
 app = Flask(__name__)
+
+register_kasa_routes(app)
 
 @app.before_request
 def log_request():
@@ -419,6 +422,12 @@ def api_chat():
         return jsonify({"reply": f"LoRA → {clear_lora()}", "lora": current_lora_name()})
     if not user_message:
         return jsonify({"error": "Empty message", "lora": current_lora_name()}), 400
+
+    # Local Kasa HS100 commands are handled directly; no LLM call required.
+    kasa_reply = handle_kasa_chat(user_message)
+    if kasa_reply is not None:
+        return jsonify({"reply": kasa_reply, "lora": current_lora_name()})
+
 
     # Non-blocking: reject if LLM/Comfy already running (protect 8GB VRAM)
     if not _gpu_lock.acquire(blocking=False):

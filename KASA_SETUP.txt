@@ -1,0 +1,27 @@
+MantisKAI Kasa HS100 LAN control
+=================================
+
+This update adds direct control of the TP-Link Kasa HS100 with MAC
+D8:0D:17:AE:1D:E6. The server discovers the plug by MAC on the local LAN;
+you do not need to configure its IP address.
+
+Install the dependency in the same Python environment used to run the server:
+
+    python -m pip install python-kasa
+
+Run your existing MantisKAI server as usual. Chat commands recognized by the
+server include:
+  - "Turn the Kasa plug on"
+  - "Turn the outlet off"
+  - "Check the Kasa plug status"
+
+Direct endpoints:
+  POST http://<server-ip>:5000/api/kasa/on
+  POST http://<server-ip>:5000/api/kasa/off
+  GET  http://<server-ip>:5000/api/kasa/status
+
+Responses include the plug's discovered IP and confirmed state. Discovery and
+control are local-LAN operations. Keep these endpoints on a trusted network;
+this minimal implementation does not add authentication.
+
+The integration is included in both mantiskai-server.py and COREserver2.py.
