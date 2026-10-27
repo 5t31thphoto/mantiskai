@@ -909,7 +909,11 @@ class Core2ServerGUI:
         self.p_lora_combo.set("None")
         self.p_lora_combo.pack(side=tk.LEFT, padx=4)
         ttk.Button(trow, text="Test", command=self.p_test).pack(side=tk.RIGHT)
-        self.p_img = tk.Label(left, text="320x240 preview\n(what the Core2 shows)",
+        # A blank image makes width/height pixels (with text only, Tk counts
+        # characters and lines, which made this box huge and hid the editor).
+        self.p_blank = tk.PhotoImage(width=320, height=240)
+        self.p_img = tk.Label(left, image=self.p_blank, compound=tk.CENTER,
+                              text="320x240 preview\n(what the Core2 shows)",
                               width=320, height=240, bg="#000000", fg="#777777")
         self.p_img.pack(pady=(6, 4), anchor=tk.W)
         self.p_status = ttk.Label(left, text="", wraplength=330)
@@ -962,6 +966,13 @@ class Core2ServerGUI:
         self.p_comfy_label = ttk.Label(right, text="", font=("Arial", 8))
         self.p_comfy_label.pack(anchor=tk.W)
 
+        # Save + report pinned to the bottom so they never get pushed off-screen
+        ttk.Button(right, text="Save profile", command=self.p_save).pack(
+            side=tk.BOTTOM, anchor=tk.E, pady=(6, 0))
+        self.p_report = ttk.Label(right, text="", font=("Consolas", 8), wraplength=620,
+                                  foreground="#00ff00")
+        self.p_report.pack(side=tk.BOTTOM, anchor=tk.W, fill=tk.X, pady=(6, 0))
+
         # scrollable node cards
         wrap = ttk.Frame(right)
         wrap.pack(fill=tk.BOTH, expand=True)
@@ -990,10 +1001,6 @@ class Core2ServerGUI:
         self.p_canvas.bind("<Enter>", bind_wheel)
         self.p_canvas.bind("<Leave>", unbind_wheel)
 
-        self.p_report = ttk.Label(right, text="", font=("Consolas", 8), wraplength=620,
-                                  foreground="#00ff00")
-        self.p_report.pack(anchor=tk.W, fill=tk.X, pady=(6, 0))
-        ttk.Button(right, text="Save profile", command=self.p_save).pack(anchor=tk.E, pady=(6, 0))
 
         self.refresh_profile_lists()
         active = profiles.active_name()
