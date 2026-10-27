@@ -40,7 +40,7 @@ bool isConnected = false;
 bool isBusy      = false;
 bool isRecording = false;
 
-String modelMode  = "realistic";
+String activeProfile = "";   // ComfyUI profile name (C button); "" = server default
 String activeLora = "None";
 
 // Last prompt used for image generation (needed for regenerate)
@@ -211,6 +211,9 @@ void fetchAndPlayTTS(const String& text);
 void requestImage(const String& prompt);
 void cycleLora();
 void clearLora();
+void cycleProfile();
+void syncServerState();
+String shortName(const String& s, int maxLen);
 void startRecording(bool forImage);
 void loadSlotCredits();
 void saveSlotCredits();
@@ -768,7 +771,9 @@ void drawImageUI() {
     M5.Display.setTextColor(COLOR_WHITE, 0x1ef8);
     M5.Display.setTextSize(1);
     M5.Display.setCursor(14, 164);
-    M5.Display.printf("M:%s | LoRA:%s", modelMode.c_str(), activeLora.c_str());
+    M5.Display.printf("P:%s | LoRA:%s",
+                      shortName(activeProfile.length() ? activeProfile : String("-"), 19).c_str(),
+                      shortName(activeLora, 19).c_str());
 
     M5.Display.fillRoundRect(8, 190, 148, 42, 6, COLOR_PURPLE);
     M5.Display.setTextColor(COLOR_WHITE, COLOR_PURPLE);
@@ -1260,6 +1265,10 @@ static int fetchTtsChunk(const String& text, int chunkIdx, uint8_t* buf, int max
 
     if (!http.begin(client, serverBase + "/api/tts")) return -1;
     http.addHeader("Content-Type", "application/json");
+    // HTTPClient only keeps response headers it was told to collect.
+    // Without this, X-Sample-Rate and X-More were always ignored.
+    const char* wantHeaders[] = { "X-Sample-Rate", "X-More" };
+    http.collectHeaders(wantHeaders, 2);
 
     JsonDocument body;
     body["text"] = text;
@@ -1278,13 +1287,22 @@ static int fetchTtsChunk(const String& text, int chunkIdx, uint8_t* buf, int max
     more = 1;
     if (http.hasHeader("X-More")) more = http.header("X-More").toInt();
 
+    // Read the whole chunk. If it would not fit, say so instead of silently
+    // dropping the end of the sentence.
+    int want = http.getSize();  // Content-Length, -1 if unknown
+    if (want > maxBytes) {
+        Serial.printf("[TTS] chunk %d is %d bytes, buffer is %d: audio will be cut\n",
+                      chunkIdx, want, maxBytes);
+    }
+    int limit = (want > 0 && want < maxBytes) ? want : maxBytes;
+
     int got = 0;
     WiFiClient* stream = http.getStreamPtr();
     unsigned long deadline = millis() + 40000;
-    while (millis() < deadline && got < maxBytes) {
+    while (millis() < deadline && got < limit) {
         int avail = stream->available();
         if (avail > 0) {
-            int n = stream->readBytes(buf + got, min(avail, maxBytes - got));
+            int n = stream->readBytes(buf + got, min(avail, limit - got));
             if (n > 0) got += n;
             else break;
         } else if (!http.connected()) {
@@ -1305,14 +1323,20 @@ void fetchAndPlayTTS(const String& text) {
 
     activeSprite = SPRITE_NONE;  // never animate between TTS chunks
 
-    const int maxBytes = 120000;
-    uint8_t* bufA = (uint8_t*)malloc(maxBytes);
-    uint8_t* bufB = (uint8_t*)malloc(maxBytes);
+    // Each buffer must hold a WHOLE chunk. At 22050 Hz mono 16-bit, audio is
+    // 44,100 bytes per second, so the old 120,000-byte buffer held only about
+    // 2.7 s. Anything longer was cut off and the next chunk started early.
+    // 1 MB (in PSRAM) holds about 23 s per chunk.
+    const int maxBytes = 1000000;
+    uint8_t* bufA = (uint8_t*)ps_malloc(maxBytes);
+    uint8_t* bufB = (uint8_t*)ps_malloc(maxBytes);
     if (!bufA) { if (bufB) free(bufB); return; }
     if (!bufB) { free(bufA); return; }
 
     int sampleRate = 22050, more = 0;
     int got = fetchTtsChunk(text, 0, bufA, maxBytes, sampleRate, more);
+    Serial.printf("[TTS] chunk 0: %d bytes @ %d Hz (%.1f s)\n",
+                  got, sampleRate, got / 2.0f / sampleRate);
     if (got < 512) {
         free(bufA); free(bufB);
         return;
@@ -1330,25 +1354,45 @@ void fetchAndPlayTTS(const String& text) {
     M5.Speaker.begin();
     M5.Speaker.setVolume(200);
 
+    const uint8_t TTS_CH = 0;  // always the same speaker channel
+
     while (true) {
         size_t samples = (size_t)playBytes / 2;
-        M5.Speaker.playRaw((const int16_t*)playBuf, samples, (uint32_t)playRate, false);
+        // How long this chunk takes to play, from its own sample count.
+        unsigned long playMs = (unsigned long)((uint64_t)samples * 1000ULL / (uint32_t)playRate);
+        unsigned long playStart = millis();
+        bool started = M5.Speaker.playRaw((const int16_t*)playBuf, samples,
+                                          (uint32_t)playRate, false, 1, TTS_CH, false);
+        Serial.printf("[TTS] play chunk %d: %u samples, %lu ms, started=%d\n",
+                      chunkIdx, (unsigned)samples, playMs, started);
 
-        // Prefetch next chunk while this one plays — eliminates gaps
+        // Prefetch next chunk while this one plays (download only, no playback)
         int nextGot = 0, nextRate = playRate, nextMore = 0;
         bool prefetched = false;
         if (hasMore) {
             nextGot = fetchTtsChunk(text, chunkIdx + 1, nextBuf, maxBytes, nextRate, nextMore);
+            Serial.printf("[TTS] chunk %d: %d bytes @ %d Hz (%.1f s)\n", chunkIdx + 1,
+                          nextGot, nextRate, nextGot / 2.0f / nextRate);
             prefetched = (nextGot >= 512);
         }
 
-        // Never advance on an estimated duration: wait for the hardware queue
-        // to finish this complete chunk before moving to the next one.
-        while (M5.Speaker.isPlaying()) {
-            delay(10);
+        // Do not start the next chunk until BOTH are true:
+        //   1. the speaker says this channel is finished, and
+        //   2. the full length of this chunk has actually elapsed (+150 ms tail).
+        // Waiting on isPlaying() alone let the next chunk start while the
+        // current one was still audible; the elapsed-time check prevents that.
+        unsigned long reportedDoneMs = 0;
+        while (true) {
+            bool playing = M5.Speaker.isPlaying(TTS_CH);
+            unsigned long elapsed = millis() - playStart;
+            if (!playing && reportedDoneMs == 0) reportedDoneMs = elapsed;
+            if (!playing && elapsed >= playMs + 150) break;
+            delay(5);
             M5.update();
         }
-        delay(80);
+        Serial.printf("[TTS] chunk %d done: isPlaying went false at %lu ms, expected %lu ms\n",
+                      chunkIdx, reportedDoneMs, playMs);
+
         if (!hasMore || !prefetched) break;
 
         // Swap — next chunk already in nextBuf, play immediately
@@ -1397,7 +1441,7 @@ void requestImage(const String& prompt) {
 
     JsonDocument body;
     body["prompt"] = prompt;
-    body["model_type"] = modelMode;
+    if (activeProfile.length()) body["profile"] = activeProfile;
     if (activeLora != "None") body["lora"] = activeLora;
     String bodyStr;
     serializeJson(body, bodyStr);
@@ -1491,6 +1535,62 @@ void clearLora() {
     http.end();
     if (currentState == STATE_CHAT) drawChatUI();
     else if (currentState == STATE_IMAGE) drawImageUI();
+}
+
+// "model.safetensors" -> "model", truncated to fit the status bar
+String shortName(const String& s, int maxLen) {
+    String n = s;
+    int dot = n.lastIndexOf('.');
+    if (dot > 0 && n.length() - dot <= 12) n = n.substring(0, dot);
+    if ((int)n.length() > maxLen) n = n.substring(0, maxLen - 1) + "~";
+    return n;
+}
+
+// C button: next ComfyUI profile on the server (like B cycles LoRAs)
+void cycleProfile() {
+    if (WiFi.status() != WL_CONNECTED) return;
+    WiFiClient client;
+    HTTPClient http;
+    http.setConnectTimeout(4000);
+    http.setTimeout(6000);
+    http.setReuse(false);
+    http.useHTTP10(true);
+    if (!http.begin(client, serverBase + "/api/profile")) return;
+    http.addHeader("Content-Type", "application/json");
+    if (http.POST("{\"action\":\"cycle\"}") == 200) {
+        String resp = http.getString();
+        JsonDocument doc;
+        if (!deserializeJson(doc, resp) && doc["profile"].is<const char*>()) {
+            activeProfile = doc["profile"].as<String>();
+            lastReply = String("Profile → ") + activeProfile;
+            if (currentState == STATE_SLOTS) slotStatus = String("Profile: ") + activeProfile;
+        }
+    }
+    http.end();
+    if (currentState == STATE_CHAT) drawChatUI();
+    else if (currentState == STATE_IMAGE) drawImageUI();
+    else if (currentState == STATE_SLOTS) drawSlotsUI();
+}
+
+// Pick up the server's current profile and LoRA (boot / Wi-Fi change)
+void syncServerState() {
+    if (WiFi.status() != WL_CONNECTED) return;
+    WiFiClient client;
+    HTTPClient http;
+    http.setConnectTimeout(3000);
+    http.setTimeout(4000);
+    http.setReuse(false);
+    http.useHTTP10(true);
+    if (!http.begin(client, serverBase + "/api/profile")) return;
+    if (http.GET() == 200) {
+        String resp = http.getString();
+        JsonDocument doc;
+        if (!deserializeJson(doc, resp)) {
+            if (doc["profile"].is<const char*>()) activeProfile = doc["profile"].as<String>();
+            if (doc["lora"].is<const char*>()) activeLora = doc["lora"].as<String>();
+        }
+    }
+    http.end();
 }
 
 void startRecording(bool forImage) {
@@ -1702,6 +1802,7 @@ void setup() {
     loadSettings();
     loadWordListsFromSD();
     connectWiFi();
+    syncServerState();
     drawChatUI();
 }
 
@@ -1751,7 +1852,7 @@ void loop() {
     }
     if (M5.BtnB.wasReleased() && !btnBLongDone) cycleLora();
 
-    // BtnC: short = model toggle; long (>800ms) = open SLOTS
+    // BtnC: short = cycle ComfyUI profile; long (>800ms) = open SLOTS
     if (M5.BtnC.wasPressed()) {
         btnCPressStart = millis();
         btnCLongDone = false;
@@ -1765,11 +1866,9 @@ void loop() {
             drawSlotsUI();
         }
     }
-    if (M5.BtnC.wasReleased() && !btnCLongDone) {
-        modelMode = (modelMode == "realistic") ? "anime" : "realistic";
-        if (currentState == STATE_IMAGE) drawImageUI();
-        else if (currentState == STATE_CHAT) drawChatUI();
-        else if (currentState == STATE_SLOTS) drawSlotsUI();
+    if (M5.BtnC.wasReleased() && !btnCLongDone && !isBusy &&
+        (currentState == STATE_IMAGE || currentState == STATE_CHAT || currentState == STATE_SLOTS)) {
+        cycleProfile();
     }
 
     if (M5.Touch.getCount() > 0) {
@@ -1998,9 +2097,8 @@ void loop() {
                 if (isBusy) return;
                 startRecording(true);
             } else if (y > 155 && y < 185) {
-                // model/LoRA status bar — tap toggles model
-                modelMode = modelMode == "realistic" ? "anime" : "realistic";
-                drawImageUI();
+                // profile/LoRA status bar — tap cycles profile (same as C)
+                cycleProfile();
             }
         } else if (currentState == STATE_SETTINGS) {
             if (y > 56 && y < 90) {
@@ -2032,6 +2130,7 @@ void loop() {
                 } else {
                     saveSettings();
                     connectWiFi();
+                    syncServerState();
                     currentState = stateBeforeSettings;
                     if (currentState == STATE_IMAGE) drawImageUI();
                     else drawChatUI();
