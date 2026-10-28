@@ -7,7 +7,7 @@
 #include <SD.h>
 #include <vector>
 #include <string.h>
-#include "mantis_anim.h"
+#include "sprites.h"
 #include "reel_sprites.h"
 
 Preferences preferences;
@@ -204,7 +204,7 @@ void drawImageUI();
 void drawSettingsUI();
 void drawKeyboardUI();
 void drawPictureUI();
-void drawBusySprite(bool force = false);
+void drawBusySprite();
 void drawSlotsUI();
 void drawTrophyUI();
 void drawSlotsRewardUI();
@@ -640,99 +640,47 @@ void drawTrophyUI() {
     M5.Display.print("< Prev    BACK=exit    Next >");
 }
 
-// ---- Busy animations -------------------------------------------------
-// A fixed stage (the "camera" never moves). Painting: the mantis stands at an
-// easel and the canvas fills up. Thinking: the mantis paces back and forth
-// with a thought bubble. Drawn off-screen, then pushed in one go (no flicker).
-static M5Canvas animCanvas(&M5.Display);
-static int animCanvasH = 0;
-static unsigned long animStartMs = 0;
-
-static void drawMantis(const uint8_t* frame, int x0, int y0, int s, bool flip) {
-    for (int y = 0; y < MANTIS_H; y++) {
-        for (int x = 0; x < MANTIS_W; x++) {
-            uint8_t i = pgm_read_byte(&frame[y * MANTIS_W + x]);
-            if (!i) continue;
-            int dx = flip ? (MANTIS_W - 1 - x) : x;
-            animCanvas.fillRect(x0 + dx * s, y0 + y * s, s, s, MANTIS_PAL[i]);
-        }
-    }
-}
-
-static uint32_t animRand(uint32_t n) { return (n * 1103515245UL + 12345UL) & 0x7fffffffUL; }
-
-void drawBusySprite(bool force) {
+void drawBusySprite() {
+    // Fills the entire reply/prompt content box (not a corner pin).
     if (activeSprite == SPRITE_NONE) return;
+
+    const int nframes = (activeSprite == SPRITE_ANIM_PAINT)
+        ? SPRITE_PAINT_FRAMES : SPRITE_THINK_FRAMES;
+
     unsigned long now = millis();
-    if (spriteFrame == 0) {            // callers set 0 when an animation starts
-        spriteFrame = 1;
-        animStartMs = now;
-        force = true;
+    if (now - spriteLastMs >= SPRITE_FRAME_MS) {
+        spriteLastMs = now;
+        spriteFrame = (spriteFrame + 1) % nframes;
     }
-    if (!force && now - spriteLastMs < 70) return;   // ~14 fps
-    spriteLastMs = now;
 
-    // Same box as before: the reply / prompt area
-    const int boxX = 10, boxY = 48, boxW = 300;
+    const uint16_t* src = (activeSprite == SPRITE_ANIM_PAINT)
+        ? SPRITE_PAINT[spriteFrame]
+        : SPRITE_THINK[spriteFrame];
+
+    // Match the reply box interior: chat uses tall box, image slightly shorter
+    const int boxX = 10;
+    const int boxY = 48;
+    const int boxW = 300;
     const int boxH = (currentState == STATE_IMAGE) ? 100 : 128;
-    if (animCanvasH != boxH) {
-        animCanvas.deleteSprite();
-        animCanvas.setColorDepth(16);
-        animCanvas.setPsram(true);
-        if (!animCanvas.createSprite(boxW, boxH)) { animCanvasH = 0; return; }
-        animCanvasH = boxH;
-    }
 
-    const unsigned long t = now - animStartMs;
-    const int S = 3;                          // 32px art -> 96px on screen
-    const int floorY = boxH - 3;
-    const int top = floorY - MANTIS_H * S + 1; // feet on the floor line
-    const uint16_t wood = 0x9CA6, wallWhite = 0xEF5C;
+    // Keep the sprite sheet's shape: scale to the box height and centre it.
+    // (Stretching 4:3 frames across the 300px-wide box distorted them.)
+    const int drawW = min(boxW, boxH * SPRITE_W / SPRITE_H);
+    const int offX = (boxW - drawW) / 2;
 
-    animCanvas.fillSprite(COLOR_BG);
-    animCanvas.drawFastHLine(0, floorY, boxW, 0x2A26);
-
-    if (activeSprite == SPRITE_ANIM_PAINT) {
-        const int mx = 60;                            // mantis never moves
-        const int cx = mx + 31 * S + 1, cy = top + 5 * S, cw = 72, ch = 14 * S;
-        // easel legs + canvas
-        animCanvas.drawWideLine(cx + 10, cy + ch, cx + 2, floorY, 2, wood);
-        animCanvas.drawWideLine(cx + cw - 10, cy + ch, cx + cw - 2, floorY, 2, wood);
-        animCanvas.drawWideLine(cx + cw / 2, cy - 6, cx + cw / 2, floorY, 2, 0x7A45);
-        animCanvas.fillRect(cx, cy, cw, ch, wallWhite);
-        animCanvas.drawRect(cx, cy, cw, ch, wood);
-        animCanvas.drawRect(cx + 1, cy + 1, cw - 2, ch - 2, wood);
-        // paint builds up while the image generates
-        static const uint16_t paints[6] = {0xC9E7, 0x3BDB, 0xF647, 0x3D47, 0xA299, 0xF425};
-        int dabs = min(60, (int)(t / 200));
-        uint32_t r = 7;
-        for (int k = 0; k < dabs; k++) {
-            r = animRand(r + k); int x = cx + 4 + r % (cw - 12);
-            r = animRand(r);     int y = cy + 4 + r % (ch - 10);
-            r = animRand(r);
-            animCanvas.fillRect(x, y, 5, 4, paints[r % 6]);
+    static uint16_t line[300];
+    M5.Display.setSwapBytes(true);
+    for (int dy = 0; dy < boxH; dy++) {
+        int sy = dy * SPRITE_H / boxH;
+        for (int dx = 0; dx < boxW; dx++) {
+            if (dx < offX || dx >= offX + drawW) { line[dx] = COLOR_BG; continue; }
+            int sx = (dx - offX) * SPRITE_W / drawW;
+            uint16_t c = pgm_read_word(&src[sy * SPRITE_W + sx]);
+            line[dx] = (c == SPRITE_TRANSPARENT) ? COLOR_BG : c;
         }
-        int f = (t / 220) % MANTIS_PAINT_FRAMES;
-        drawMantis(MANTIS_PAINT[f], mx, top, S, false);
-    } else {
-        // pace left and right across the box, turning at each end
-        const int minX = 4, maxX = boxW - MANTIS_W * S - 4, span = maxX - minX;
-        int p = (int)((t * 35UL / 1000UL) % (2UL * span));
-        bool right = p < span;
-        int x = right ? minX + p : minX + 2 * span - p;
-        int f = (t / 150) % MANTIS_WALK_FRAMES;
-        drawMantis(MANTIS_WALK[f], x, top, S, !right);
-        // thought bubble that follows the head
-        int hx = x + (right ? 22 : 9) * S;
-        int bx = hx + (right ? 10 : -46);
-        if (top - 26 >= 0) {
-            animCanvas.fillEllipse(bx + 18, top - 17, 18, 9, wallWhite);
-            animCanvas.fillCircle(hx + (right ? 6 : -4), top - 4, 2, wallWhite);
-            int dots = (t / 400) % 4;
-            for (int k = 0; k < dots; k++) animCanvas.fillRect(bx + 8 + k * 8, top - 19, 4, 4, COLOR_DARK);
-        }
+        M5.Display.pushImage(boxX, boxY + dy, boxW, 1, line);
     }
-    animCanvas.pushSprite(boxX, boxY);
+    M5.Display.setSwapBytes(false);
 }
 
 void drawChatUI() {
@@ -749,7 +697,7 @@ void drawChatUI() {
 
     if (isBusy) {
         // Full reply-box animation (think cycle) — no text under it
-        drawBusySprite(true);
+        drawBusySprite();
     } else {
         M5.Display.setTextColor(COLOR_WHITE, COLOR_BG);
         M5.Display.setTextSize(1);
@@ -814,7 +762,7 @@ void drawImageUI() {
 
     if (isBusy) {
         // Full prompt-box paint animation
-        drawBusySprite(true);
+        drawBusySprite();
     } else {
         M5.Display.setTextColor(COLOR_WHITE, COLOR_BG);
         M5.Display.setTextSize(1);
