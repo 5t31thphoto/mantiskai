@@ -1,0 +1,12 @@
+{
+  "descriptive": ["cute", "adorable", "tiny", "elegant", "cheerful", "mysterious", "brave", "sparkly", "sleepy", "mischievous"],
+  "subject": ["mantis girl", "anime girl", "fox girl", "robot maid", "witch apprentice", "space pilot girl", "cat girl", "dragon girl", "bunny girl", "android idol"],
+  "general": ["with big expressive eyes", "in a frilly outfit", "wearing a hoodie", "with glowing accessories", "soft pastel hair", "with a tiny backpack"],
+  "setting": ["in a sunny meadow", "on a spaceship bridge", "by a quiet lake", "in a neon city alley", "in an enchanted forest", "at a seaside dock", "in a cozy library"],
+  "action": ["fishing with a bamboo rod", "dancing joyfully", "piloting a starfighter", "reading a spellbook", "sipping tea", "riding a bicycle", "painting on a canvas", "flying a kite"],
+  "style_mod": ["soft shading", "cel shading", "watercolor edges", "clean lineart", "glowing highlights"],
+  "style": ["anime illustration", "pixiv trending style", "studio ghibli inspired", "modern anime key visual", "chibi style"],
+  "quality": ["Pixel perfect, high levels of vivid detail", "masterpiece, best quality, ultra detailed", "sharp focus, rich colors"],
+  "jackpot_pose": ["celebrating with confetti", "victory pose arms raised", "blowing a kiss", "spinning happily", "holding a golden trophy"],
+  "gameover": ["sitting alone looking sad", "empty wallet tears", "rainy window wistful", "hugging knees on the floor"]
+}
