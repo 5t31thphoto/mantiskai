@@ -1,6 +1,6 @@
 """
 MantisKAI PC Bridge
-  POST /api/chat   → {"reply": "...", "lora": "..."}          small JSON
+  POST /api/chat   → {"reply": "...", "lora": "...", "moods": [...]}  small JSON
   POST /api/tts    → raw WAV bytes                             binary
   POST /api/stt    → {"text": "..."}                           accepts binary WAV/PCM
   POST /api/image  → {"image_base64": "...", "lora": "..."}
@@ -25,6 +25,8 @@ from tkinter import scrolledtext, ttk, messagebox, filedialog
 from flask import Flask, request, jsonify, Response, has_request_context
 from mantiskai_kasa import handle_kasa_chat, register_kasa_routes
 import mantiskai_profiles as mp
+import mantiskai_avatar as mav
+from urllib.parse import quote as url_quote
 from openai import OpenAI
 
 try:
@@ -159,11 +161,19 @@ def trim_chat_history(hard=False):
     chat_history = [system] + rest[-limit:]
     print(f"[CTX] trimmed history → {len(chat_history)} messages (limit={limit})")
 
+def load_piper_voice(path):
+    """Load the voice with phoneme alignments switched on (piper-tts >= 1.5 patches the model in memory;
+    audio is unchanged). Older Piper doesn't know the option: load exactly as before."""
+    try:
+        return PiperVoice.load(path, include_alignments=True)
+    except TypeError:
+        return PiperVoice.load(path)
+
 llm_voice = None
 llm_sample_rate = 22050
 if PiperVoice:
     try:
-        llm_voice = PiperVoice.load(TTS_VOICE_PATH)
+        llm_voice = load_piper_voice(TTS_VOICE_PATH)
         llm_sample_rate = llm_voice.config.sample_rate
     except Exception as e:
         print(f"[TTS] load failed: {e}")
@@ -337,6 +347,103 @@ def split_tts_chunks(text, max_chars=140):
     return chunks
 
 
+
+# ---- Avatar mood tagging (parallel to TTS chunks) --------------------
+# Pose index on device: 0=base 1=accomplished 2=excited 3=sad 4=confused
+_MOOD_NAMES = ("base", "accomplished", "excited", "sad", "confused")
+
+_MOOD_KEYWORDS = {
+    "accomplished": (
+        "turned on", "turned off", "outlet is on", "outlet is off",
+        "plug is on", "plug is off", "done", "completed", "finished",
+        "i did", "all set", "taken care", "executed",
+    ),
+    "excited": (
+        "great", "awesome", "amazing", "wonderful", "love", "happy",
+        "excited", "fantastic", "excellent", "yay", "glad", "perfect",
+    ),
+    "sad": (
+        "sorry", "unfortunately", "can't", "cannot", "unable", "failed",
+        "failure", "sad", "couldn't", "could not", "won't be able",
+    ),
+    "confused": (
+        "not sure", "don't understand", "do not understand", "unclear",
+        "confused", "what do you mean", "could you clarify", "hmm",
+        "i'm not sure", "unsure",
+    ),
+}
+
+
+def score_mood(text):
+    """Return (mood_name, score) for a short text span. Pure keywords, no ML."""
+    t = (text or "").lower()
+    if not t.strip():
+        return "base", 0
+    scores = {m: 0 for m in _MOOD_NAMES}
+    for mood, kws in _MOOD_KEYWORDS.items():
+        for kw in kws:
+            if kw in t:
+                scores[mood] += 2 if " " in kw else 1
+    # Light punctuation bias
+    if t.count("!") >= 2:
+        scores["excited"] += 1
+    if t.rstrip().endswith("?") and scores["confused"] == 0:
+        scores["confused"] += 1
+    best = max(scores, key=scores.get)
+    return best, scores[best]
+
+
+def opening_mood_from_user(user_message):
+    """Bias the first spoken chunk from what the user asked."""
+    t = (user_message or "").lower()
+    if any(p in t for p in ("turn on", "turn off", "switch on", "switch off",
+                            "power on", "power off")):
+        return "base"  # wait for accomplished on the reply
+    if "?" in t or t.startswith(("what", "why", "how", "when", "where", "who")):
+        return "confused"
+    m, s = score_mood(t)
+    return m if s > 0 else "base"
+
+
+def build_moods(user_message, reply, kasa=False, kasa_ok=True):
+    """
+    One mood per TTS chunk (same segmentation as /api/tts).
+    Chunk 0 biased by user message; later chunks by their own text + hysteresis.
+    """
+    if kasa:
+        return ["accomplished"] if kasa_ok else ["sad"]
+
+    chunks = split_tts_chunks(reply)
+    if not chunks:
+        return ["base"]
+
+    moods = []
+    prev = opening_mood_from_user(user_message)
+    for i, chunk in enumerate(chunks):
+        if i == 0:
+            # Prefer user bias; upgrade if the reply chunk itself is strong
+            m, s = score_mood(chunk)
+            if s >= 2:
+                prev = m
+            moods.append(prev)
+        else:
+            m, s = score_mood(chunk)
+            if s >= 2:
+                prev = m
+            # else keep prev (hysteresis)
+            moods.append(prev)
+    return moods
+
+
+def chat_payload(reply, lora, user_message="", kasa=False, kasa_ok=True):
+    """Standard chat JSON including per-chunk moods for the avatar."""
+    return {
+        "reply": reply,
+        "lora": lora,
+        "moods": build_moods(user_message, reply, kasa=kasa, kasa_ok=kasa_ok),
+    }
+
+
 def synthesize_wav_bytes(text, speaker_id=0):
     if not text or not llm_voice:
         return None
@@ -356,6 +463,35 @@ def synthesize_wav_bytes(text, speaker_id=0):
     except Exception as e:
         print(f"[TTS] {e}")
         return None
+
+def synthesize_tts_chunk(text, speaker_id=0):
+    """/api/tts audio: same PCM synthesize_wav_bytes produces (minus the WAV header), plus the mouth-shape
+    track from Piper's phoneme alignments. Returns (pcm_bytes, visemes_b64_or_None, sample_rate)."""
+    rate = int(llm_sample_rate)
+    if not text or not llm_voice:
+        return None, None, rate
+    clean = text.replace('"', '').replace('*', '').replace('#', '').replace('...', '..')
+    cfg = SynthesisConfig()
+    cfg.speaker_id = speaker_id
+    pcm = bytearray()
+    aligned, have_all = [], True
+    try:
+        for chunk in llm_voice.synthesize(clean, cfg, include_alignments=True):
+            pcm += chunk.audio_int16_bytes
+            al = getattr(chunk, "phoneme_alignments", None)
+            if not al:
+                have_all = False
+            else:
+                aligned += [(a.phoneme, int(a.num_samples)) for a in al]
+    except TypeError:  # Piper without alignments: exactly the old path
+        wav = synthesize_wav_bytes(text, speaker_id)
+        return (wav[44:] if wav and len(wav) > 44 else None), None, rate
+    except Exception as e:
+        print(f"[TTS] {e}")
+        return None, None, rate
+    vis = mav.encode_visemes(aligned, rate) if (have_all and aligned) else None
+    return bytes(pcm), vis, rate
+
 
 def speak_locally(text):
     if not text or not llm_voice or not pygame:
@@ -533,7 +669,9 @@ def api_chat():
     # Local Kasa HS100 commands are handled directly; no LLM call required.
     kasa_reply = handle_kasa_chat(user_message)
     if kasa_reply is not None:
-        return jsonify({"reply": kasa_reply, "lora": current_lora_name()})
+        ok = "couldn't" not in kasa_reply.lower() and "could not" not in kasa_reply.lower()
+        return jsonify(chat_payload(kasa_reply, current_lora_name(),
+                                    user_message, kasa=True, kasa_ok=ok))
 
 
     # Non-blocking: reject if LLM/Comfy already running (protect 8GB VRAM)
@@ -551,7 +689,7 @@ def api_chat():
                 model=AI_MODEL, messages=chat_history, temperature=0.7, timeout=100.0)
             reply = response.choices[0].message.content or ""
             chat_history.append({"role": "assistant", "content": reply})
-            return jsonify({"reply": reply, "lora": current_lora_name()})
+            return jsonify(chat_payload(reply, current_lora_name(), user_message))
         except Exception as e:
             err = str(e).lower()
             # Context overflow → hard-trim and retry once (proven recovery)
@@ -563,7 +701,7 @@ def api_chat():
                         model=AI_MODEL, messages=chat_history, temperature=0.7, timeout=100.0)
                     reply = response.choices[0].message.content or ""
                     chat_history.append({"role": "assistant", "content": reply})
-                    return jsonify({"reply": reply, "lora": current_lora_name()})
+                    return jsonify(chat_payload(reply, current_lora_name(), user_message))
                 except Exception as e2:
                     return jsonify({"error": str(e2), "lora": current_lora_name()}), 500
             return jsonify({"error": str(e), "lora": current_lora_name()}), 500
@@ -608,13 +746,11 @@ def api_tts():
         )
 
     piece = segments[chunk_idx]
-    wav = synthesize_wav_bytes(piece)
-    if not wav or len(wav) < 44:
+    pcm, visemes, rate = synthesize_tts_chunk(piece)
+    if not pcm:
         print(f"[TTS] synth failed chunk {chunk_idx}/{total}: {piece[:40]!r}")
         return Response(b"", status=503)
 
-    pcm = wav[44:]
-    rate = int(llm_sample_rate)
     more = 1 if (chunk_idx + 1) < total else 0
     print(f"[TTS] chunk {chunk_idx + 1}/{total} ({len(piece)} chars) → {len(pcm)} pcm @ {rate} Hz more={more}")
     return Response(
@@ -626,6 +762,10 @@ def api_tts():
             "X-Chunk-Index": str(chunk_idx),
             "X-Chunk-Total": str(total),
             "X-More": str(more),
+            # the exact words in this chunk, for line-by-line subtitles on the device
+            "X-Text": url_quote(piece, safe=""),
+            # mouth shapes for this chunk: base64 (shape, 10 ms units) pairs; absent = loudness-only mouth
+            **({"X-Visemes": visemes} if visemes else {}),
         },
     )
 
@@ -739,10 +879,20 @@ class Core2ServerGUI:
         nb.add(self.image_tab, text="Picture Mode")
         nb.add(self.profiles_tab, text="Profiles")
         nb.add(self.settings_tab, text="Settings")
+        self.avatar_tab = ttk.Frame(nb)
+        nb.add(self.avatar_tab, text="Avatar")
         self.setup_chat()
         self.setup_image()
         self.setup_profiles()
         self.setup_settings()
+        self.avatar = mav.AvatarTab(self.avatar_tab, {
+            "synth_wav": synthesize_wav_bytes,          # the same Piper voice the device hears
+            "synth_tts_chunk": synthesize_tts_chunk,    # same PCM + mouth shapes /api/tts sends
+            "split_chunks": split_tts_chunks,           # same chunks as /api/tts
+            "build_moods": build_moods,                 # same mood choice as /api/chat
+            "pygame": pygame,
+            "project_path": os.path.join(os.path.dirname(os.path.abspath(__file__)), "avatar", "project.json"),
+        })
         self.root.after(500, lambda: threading.Thread(target=self.check_lm, daemon=True).start())
 
     def setup_chat(self):
@@ -1494,7 +1644,7 @@ class Core2ServerGUI:
         # reload piper if path changed
         if PiperVoice:
             try:
-                llm_voice = PiperVoice.load(TTS_VOICE_PATH)
+                llm_voice = load_piper_voice(TTS_VOICE_PATH)
                 llm_sample_rate = llm_voice.config.sample_rate
                 self.log("SYSTEM", f"Piper reloaded @ {llm_sample_rate} Hz")
             except Exception as e:

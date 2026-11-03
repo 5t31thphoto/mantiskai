@@ -7,6 +7,7 @@
 #include <SD.h>
 #include <vector>
 #include <string.h>
+#include <math.h>
 #include "sprites.h"
 #include "reel_sprites.h"
 
@@ -86,6 +87,453 @@ SpriteAnim activeSprite = SPRITE_NONE;
 int spriteFrame = 0;
 unsigned long spriteLastMs = 0;
 const unsigned long SPRITE_FRAME_MS = 180;
+
+// ============================================================
+//  High-Quality Avatar / Asymmetric Mouth Engine
+//  Assets produced by the server's Avatar tab (tools/mantiskai_avatar.py) → /m5_asymmetric_poses.bin on SD
+//  Binary: header + 5×(points + mouth crop + full 320×240 face)
+// ============================================================
+void drawChatUI();  // defined further down; the avatar screen falls back to it
+
+struct MultiHeader {
+    char     magic[4];
+    uint16_t w, h, targetX, targetY, numPoints;
+};
+struct Point2D { uint16_t x, y; };
+
+// Mouth/subtitle tuning. POS2 files carry these (set in the server's Avatar tab); POSE (v1) files
+// use the defaults. DEVICE-MATCH: tools/mantiskai_avatar.py uses the same values and math.
+struct AvatarParams {
+    float attack = 0.45f, release = 0.12f, flutter = 0.35f, gain = 2.8f;
+    float pullLower = 8.8f, pullUpper = -2.8f, falloff = 900.0f;
+    int   lookaheadMs = 40, lineChars = 34;
+    float widthPull = 6.0f;   // px the mouth corners move at full wide/round (viseme mode)
+};
+
+MultiHeader  avHeader{};
+AvatarParams avParams;
+Point2D*    poseCtrlPoints[5] = {nullptr};
+uint16_t*   poseTextures[5]   = {nullptr};   // mouth crop
+uint16_t*   poseFullFaces[5]  = {nullptr};   // full 320×240 face
+float*      poseField[5]      = {nullptr};   // per-pixel lip displacement at full opening
+float*      poseFieldX[5]     = {nullptr};   // per-pixel corner displacement at full width (viseme mode)
+int         poseSplit[5]      = {0};         // lip line (mouth-local y)
+int         poseMinX[5] = {0}, poseMaxX[5] = {0}; // mouth corners (mouth-local x)
+
+// Mouth shapes driven by Piper's phonemes (server header X-Visemes). DEVICE-MATCH: DEFAULT_VISEMES.
+static const int VIS_COUNT = 10;  // rest, MBP, FV, L/TH, W/OO, O, EE, AH, consonant, uh
+float visTable[VIS_COUNT][2] = { {0.0f, 0.0f}, {-0.08f, -0.05f}, {0.12f, 0.15f}, {0.30f, 0.10f}, {0.25f, -0.70f},
+                                 {0.55f, -0.45f}, {0.35f, 0.55f}, {0.90f, 0.15f}, {0.28f, 0.20f}, {0.40f, 0.0f} };
+uint16_t visCavity = 0x2021, visTeeth = 0xE71A;
+uint16_t*   renderWorkspace   = nullptr;
+
+int   currentPoseIdx     = 0;     // 0=Base 1=Accomplished 2=Excited 3=Sad 4=Confused
+float voiceIntensity     = 0.0f;  // 0..1 mouth opening for the frame being drawn
+bool  avatarLoaded       = false;
+bool  showingAvatar      = false; // true while TTS plays → avatar + subtitles UI
+
+static const char* POSE_NAMES[5] = { "Base", "Accomplished", "Excited", "Sad", "Confused" };
+static const int   AV_ENV_STEP_MS = 20;                 // DEVICE-MATCH: envelope resolution
+static const int   AV_HEADER_H = 28, AV_SUB_H = 44;     // DEVICE-MATCH: screen layout
+
+// Per-chunk moods from server (parallel to TTS chunks). Empty → stay on Base.
+static const int MOOD_MAX = 32;
+int   replyMoods[MOOD_MAX];
+int   replyMoodCount = 0;
+
+static int moodNameToIdx(const char* name) {
+    if (!name || !name[0]) return 0;
+    // server sends lowercase; compare case-insensitively without strcasecmp
+    char buf[24];
+    size_t n = 0;
+    while (name[n] && n < sizeof(buf) - 1) {
+        char c = name[n];
+        buf[n] = (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c;
+        n++;
+    }
+    buf[n] = 0;
+    if (!strcmp(buf, "accomplished") || !strcmp(buf, "done")) return 1;
+    if (!strcmp(buf, "excited") || !strcmp(buf, "happy")) return 2;
+    if (!strcmp(buf, "sad")) return 3;
+    if (!strcmp(buf, "confused") || !strcmp(buf, "thinking")) return 4;
+    return 0; // base
+}
+
+static void applyMoodForChunk(int chunkIdx) {
+    if (replyMoodCount <= 0) return;
+    int i = chunkIdx;
+    if (i < 0) i = 0;
+    if (i >= replyMoodCount) i = replyMoodCount - 1;
+    int next = replyMoods[i];
+    if (next < 0 || next > 4) next = 0;
+    if (next != currentPoseIdx) {
+        currentPoseIdx = next;
+        Serial.printf("[AVATAR] chunk %d mood → %s\n", chunkIdx, POSE_NAMES[currentPoseIdx]);
+    }
+}
+
+static uint16_t be16(const uint8_t* b) { return (uint16_t)((b[0] << 8) | b[1]); }
+
+// Precompute, once per pose, how far each mouth pixel moves at full opening (same sum the old
+// per-frame loop did). Each frame is then one multiply per pixel.
+static void buildPoseField(int i, float splitY) {
+    const int W = avHeader.w, H = avHeader.h, N = avHeader.numPoints;
+    Point2D* pts = poseCtrlPoints[i];
+    for (int y = 0; y < H; y++) {
+        for (int x = 0; x < W; x++) {
+            float tw = 0.0f, acc = 0.0f;
+            for (int p = 0; p < N; p++) {
+                float dx = (float)x - (float)pts[p].x;
+                float dy = (float)y - (float)pts[p].y;
+                float d2 = dx * dx + dy * dy + 0.65f;
+                float w  = 1.0f / d2;
+                if (d2 > avParams.falloff) w *= avParams.falloff / d2;   // distance falloff
+                float k  = ((float)pts[p].y > splitY) ? avParams.pullLower : avParams.pullUpper;
+                tw  += w;
+                acc += w * k;
+            }
+            poseField[i][y * W + x] = acc / (tw + 1e-5f);
+        }
+    }
+    // horizontal: corners move outward at width +1 (DEVICE-MATCH: displacement_field_x)
+    int mn = pts[0].x, mx = pts[0].x;
+    for (int p = 1; p < N; p++) { mn = min(mn, (int)pts[p].x); mx = max(mx, (int)pts[p].x); }
+    float cx = (mn + mx) / 2.0f, half = max(1.0f, (mx - mn) / 2.0f);
+    for (int y = 0; y < H; y++) {
+        for (int x = 0; x < W; x++) {
+            float tw = 0.0f, acc = 0.0f;
+            for (int p = 0; p < N; p++) {
+                float dx = (float)x - (float)pts[p].x;
+                float dy = (float)y - (float)pts[p].y;
+                float d2 = dx * dx + dy * dy + 0.65f;
+                float w  = 1.0f / d2;
+                if (d2 > avParams.falloff) w *= avParams.falloff / d2;
+                float k  = ((float)pts[p].x - cx) / half * avParams.widthPull;
+                tw  += w;
+                acc += w * k;
+            }
+            poseFieldX[i][y * W + x] = acc / (tw + 1e-5f);
+        }
+    }
+    poseSplit[i] = (int)splitY;
+    poseMinX[i] = mn;
+    poseMaxX[i] = mx;
+}
+
+bool loadAsymmetricAssets() {
+    if (!SD.exists("/m5_asymmetric_poses.bin")) {
+        Serial.println("[AVATAR] m5_asymmetric_poses.bin not found on SD");
+        return false;
+    }
+    File f = SD.open("/m5_asymmetric_poses.bin", FILE_READ);
+    if (!f) return false;
+
+    if (f.read((uint8_t*)&avHeader, sizeof(avHeader)) != sizeof(avHeader)) {
+        f.close();
+        return false;
+    }
+    bool v2 = memcmp(avHeader.magic, "POS2", 4) == 0;
+    if (!v2 && memcmp(avHeader.magic, "POSE", 4) != 0) {
+        Serial.println("[AVATAR] bad magic");
+        f.close();
+        return false;
+    }
+    avHeader.w         = __builtin_bswap16(avHeader.w);
+    avHeader.h         = __builtin_bswap16(avHeader.h);
+    avHeader.targetX   = __builtin_bswap16(avHeader.targetX);
+    avHeader.targetY   = __builtin_bswap16(avHeader.targetY);
+    avHeader.numPoints = __builtin_bswap16(avHeader.numPoints);
+
+    if (avHeader.w == 0 || avHeader.h == 0 || avHeader.numPoints == 0 || avHeader.numPoints > 32 ||
+        avHeader.targetX + avHeader.w > 320 || avHeader.targetY + avHeader.h > 240) {
+        Serial.println("[AVATAR] invalid header dimensions/points");
+        f.close();
+        return false;
+    }
+
+    avParams = AvatarParams();
+    if (v2) { // tuning block from the server's Avatar tab
+        uint8_t b[24];
+        if (f.read(b, sizeof(b)) != sizeof(b)) { f.close(); return false; }
+        avParams.attack      = be16(b + 0) / 1000.0f;
+        avParams.release     = be16(b + 2) / 1000.0f;
+        avParams.flutter     = be16(b + 4) / 1000.0f;
+        avParams.gain        = be16(b + 6) / 100.0f;
+        avParams.pullLower   = (int16_t)be16(b + 8) / 100.0f;
+        avParams.pullUpper   = (int16_t)be16(b + 10) / 100.0f;
+        avParams.falloff     = (float)be16(b + 12);
+        avParams.lookaheadMs = be16(b + 14);
+        avParams.lineChars   = constrain((int)be16(b + 16), 16, 40);
+        if (be16(b + 18)) avParams.widthPull = be16(b + 18) / 100.0f;
+    }
+
+    size_t patchBytes  = (size_t)avHeader.w * avHeader.h * 2;
+    size_t fieldBytes  = (size_t)avHeader.w * avHeader.h * sizeof(float);
+    size_t pointsBytes = (size_t)avHeader.numPoints * sizeof(Point2D);
+    size_t fullBytes   = 320UL * 240UL * 2UL;
+
+    renderWorkspace = (uint16_t*)ps_malloc(patchBytes);
+    if (!renderWorkspace) {
+        Serial.println("[AVATAR] renderWorkspace alloc failed");
+        f.close();
+        return false;
+    }
+
+    for (int i = 0; i < 5; i++) {
+        poseCtrlPoints[i] = (Point2D*)ps_malloc(pointsBytes);
+        poseTextures[i]   = (uint16_t*)ps_malloc(patchBytes);
+        poseFullFaces[i]  = (uint16_t*)ps_malloc(fullBytes);
+        poseField[i]      = (float*)ps_malloc(fieldBytes);
+        poseFieldX[i]     = (float*)ps_malloc(fieldBytes);
+        if (!poseCtrlPoints[i] || !poseTextures[i] || !poseFullFaces[i] || !poseField[i] || !poseFieldX[i]) {
+            Serial.printf("[AVATAR] pose %d alloc failed\n", i);
+            f.close();
+            return false;
+        }
+        float splitY = avHeader.h * 0.48f; // v1: fixed lip line
+        if (v2) {
+            uint8_t b[2];
+            if (f.read(b, 2) != 2) { f.close(); return false; }
+            splitY = (float)be16(b);
+        }
+        if (f.read((uint8_t*)poseCtrlPoints[i], pointsBytes) != pointsBytes) { f.close(); return false; }
+        for (int p = 0; p < avHeader.numPoints; p++) {
+            poseCtrlPoints[i][p].x = __builtin_bswap16(poseCtrlPoints[i][p].x);
+            poseCtrlPoints[i][p].y = __builtin_bswap16(poseCtrlPoints[i][p].y);
+        }
+        if (f.read((uint8_t*)poseTextures[i], patchBytes) != patchBytes) { f.close(); return false; }
+        // Full face present in new bins; older bins leave the buffer black
+        if (f.available() >= (int)fullBytes) {
+            f.read((uint8_t*)poseFullFaces[i], fullBytes);
+        } else {
+            memset(poseFullFaces[i], 0, fullBytes);
+        }
+        buildPoseField(i, splitY);
+    }
+    // optional mouth-shape table appended by newer exports ("VIS1"); older files keep the defaults
+    uint8_t tag[4];
+    if (f.available() >= 4 + VIS_COUNT * 4 + 4 && f.read(tag, 4) == 4 && memcmp(tag, "VIS1", 4) == 0) {
+        uint8_t b[VIS_COUNT * 4 + 4];
+        if (f.read(b, sizeof(b)) == sizeof(b)) {
+            for (int v = 0; v < VIS_COUNT; v++) {
+                visTable[v][0] = (int16_t)be16(b + v * 4) / 1000.0f;
+                visTable[v][1] = (int16_t)be16(b + v * 4 + 2) / 1000.0f;
+            }
+            visCavity = be16(b + VIS_COUNT * 4);
+            visTeeth  = be16(b + VIS_COUNT * 4 + 2);
+        }
+    }
+    f.close();
+    avatarLoaded = true;
+    Serial.printf("[AVATAR] %s %ux%u points=%u target=(%u,%u) lineChars=%d\n", v2 ? "POS2" : "POSE",
+                  avHeader.w, avHeader.h, avHeader.numPoints, avHeader.targetX, avHeader.targetY,
+                  avParams.lineChars);
+    return true;
+}
+
+// ---- mouth envelope (DEVICE-MATCH: loudness_steps / smooth_envelope / intensity_at) ----
+// One value per 20 ms of a TTS chunk, computed before the chunk plays, so the mouth follows the
+// syllables instead of one loudness for the whole chunk.
+static float* buildMouthEnvelope(const int16_t* pcm, size_t samples, int rate, int& count) {
+    int step = rate * AV_ENV_STEP_MS / 1000;
+    if (step < 1) step = 1;
+    int win = step * 2;
+    count = (int)((samples + step - 1) / step);
+    if (count < 1) count = 1;
+    float* env = (float*)ps_malloc(count * sizeof(float));
+    if (!env) { count = 0; return nullptr; }
+    float s = 0.0f;
+    for (int i = 0; i < count; i++) {
+        size_t a = (size_t)i * step, b = min(a + (size_t)win, samples);
+        float raw = 0.0f;
+        if (b > a && b - a >= 8) {
+            double sumSq = 0.0;
+            int32_t peak = 0;
+            for (size_t k = a; k < b; k++) {
+                int32_t v = pcm[k];
+                sumSq += (double)v * v;
+                int32_t av = v < 0 ? -v : v;
+                if (av > peak) peak = av;
+            }
+            float rms = sqrtf((float)(sumSq / (double)(b - a))) / 32768.0f;
+            float pk  = (float)peak / 32768.0f;
+            raw = min(1.0f, (rms * 0.75f + pk * 0.25f) * avParams.gain);
+        }
+        s += (raw - s) * (raw > s ? avParams.attack : avParams.release);
+        env[i] = s;
+    }
+    return env;
+}
+
+static float mouthIntensityAt(const float* env, int count, unsigned long tMs) {
+    if (!env || count <= 0) return 0.0f;
+    int i = (int)((tMs + (unsigned long)avParams.lookaheadMs) / AV_ENV_STEP_MS);
+    if (i >= count) i = count - 1;
+    float base = env[i];
+    float flutter = 0.0f;
+    if (base > 0.15f) flutter = (sinf(tMs * 0.055f) * 0.5f + 0.5f) * avParams.flutter * base;
+    return constrain(base + flutter, 0.0f, 1.0f);
+}
+
+void animateMouthHQ(int poseIdx) {
+    if (!avatarLoaded || poseIdx < 0 || poseIdx > 4) return;
+    const int W = avHeader.w, H = avHeader.h;
+    const uint16_t* src = poseTextures[poseIdx];
+    const float* F = poseField[poseIdx];
+    const float I = voiceIntensity;
+    for (int y = 0; y < H; y++) {
+        for (int x = 0; x < W; x++) {
+            int sy = y - (int)(I * F[y * W + x]);
+            if (sy < 0) sy = 0;
+            else if (sy >= H) sy = H - 1;
+            renderWorkspace[y * W + x] = src[sy * W + x];
+        }
+    }
+    M5.Display.startWrite();
+    M5.Display.setAddrWindow(avHeader.targetX, avHeader.targetY, W, H);
+    M5.Display.pushPixels(renderWorkspace, (uint32_t)W * H);
+    M5.Display.endWrite();
+}
+
+// Viseme mode: open/close + wide/round; the gap between the lips shows the mouth interior
+// (DEVICE-MATCH: warp_shape). Two multiplies and a couple of compares per pixel.
+void animateMouthShape(int poseIdx, float open, float width) {
+    if (!avatarLoaded || poseIdx < 0 || poseIdx > 4) return;
+    const int W = avHeader.w, H = avHeader.h;
+    const uint16_t* src = poseTextures[poseIdx];
+    const float* FY = poseField[poseIdx];
+    const float* FX = poseFieldX[poseIdx];
+    const int split = poseSplit[poseIdx], mn = poseMinX[poseIdx], mx = poseMaxX[poseIdx];
+    // the textures are stored byte-swapped for pushPixels; convert the interior colours the same way
+    const uint16_t cav = __builtin_bswap16(visCavity), teeth = __builtin_bswap16(visTeeth);
+    const uint16_t upperGap = open > 0.3f ? teeth : cav;
+    for (int y = 0; y < H; y++) {
+        for (int x = 0; x < W; x++) {
+            int i = y * W + x;
+            int sy = y - (int)(open * FY[i]);
+            int sx = x - (int)(width * FX[i]);
+            if (sy < 0) sy = 0; else if (sy >= H) sy = H - 1;
+            if (sx < 0) sx = 0; else if (sx >= W) sx = W - 1;
+            uint16_t c = src[sy * W + sx];
+            if (x >= mn && x <= mx) {
+                if (y > split && sy <= split) c = cav;
+                else if (y <= split && sy > split) c = upperGap;
+            }
+            renderWorkspace[i] = c;
+        }
+    }
+    M5.Display.startWrite();
+    M5.Display.setAddrWindow(avHeader.targetX, avHeader.targetY, W, H);
+    M5.Display.pushPixels(renderWorkspace, (uint32_t)W * H);
+    M5.Display.endWrite();
+}
+
+// X-Visemes: base64 of (shape, duration in 10 ms) pairs -> start times (ms) and shapes.
+struct VisemeTrack { int n = 0; uint16_t startMs[400]; uint8_t shape[400]; uint32_t endMs = 0; };
+static void decodeVisemes(const String& b64, VisemeTrack& t) {
+    t.n = 0; t.endMs = 0;
+    if (!b64.length()) return;
+    uint8_t raw[800];
+    size_t len = 0;
+    if (mbedtls_base64_decode(raw, sizeof(raw), &len, (const unsigned char*)b64.c_str(), b64.length()) != 0) return;
+    uint32_t ms = 0;
+    for (size_t i = 0; i + 1 < len && t.n < 400; i += 2) {
+        t.startMs[t.n] = (uint16_t)min<uint32_t>(ms, 65535);
+        t.shape[t.n] = raw[i] < VIS_COUNT ? raw[i] : 0;
+        t.n++;
+        ms += raw[i + 1] * 10;
+    }
+    t.endMs = ms;
+}
+static int visemeAt(const VisemeTrack& t, uint32_t ms) {
+    if (t.n == 0 || ms >= t.endMs) return 0;
+    int v = 0;
+    for (int i = 0; i < t.n && t.startMs[i] <= ms; i++) v = t.shape[i];
+    return v;
+}
+static float visEase(float cur, float target, float dtMs, float rate) {
+    float k = 1.0f - powf(1.0f - rate, max(0.0f, dtMs / AV_ENV_STEP_MS));
+    return cur + (target - cur) * k;
+}
+
+// ---- subtitles (DEVICE-MATCH: wrap_lines / line_index_at) ----
+static std::vector<String> wrapSubtitle(const String& text, int n) {
+    std::vector<String> lines;
+    String cur;
+    int i = 0, len = text.length();
+    while (i < len) {
+        while (i < len && text[i] == ' ') i++;
+        int j = i;
+        while (j < len && text[j] != ' ') j++;
+        if (j == i) break;
+        String w = text.substring(i, j);
+        i = j;
+        while ((int)w.length() > n) { // longer than a line: hard split
+            if (cur.length()) { lines.push_back(cur); cur = ""; }
+            lines.push_back(w.substring(0, n));
+            w = w.substring(n);
+        }
+        if (!cur.length()) cur = w;
+        else if ((int)(cur.length() + 1 + w.length()) <= n) cur += " " + w;
+        else { lines.push_back(cur); cur = w; }
+    }
+    if (cur.length()) lines.push_back(cur);
+    if (lines.empty()) lines.push_back("");
+    return lines;
+}
+
+static int subtitleLineAt(const std::vector<String>& lines, unsigned long tMs, unsigned long durMs) {
+    int total = 0;
+    for (const String& l : lines) total += l.length() + 1;
+    if (total <= 0) return 0;
+    int acc = 0;
+    for (size_t i = 0; i < lines.size(); i++) {
+        acc += lines[i].length() + 1;
+        if ((uint64_t)tMs * total < (uint64_t)durMs * acc) return (int)i;
+    }
+    return (int)lines.size() - 1;
+}
+
+// Spoken line in white, the next line dimmed, in the bar at the bottom of the face.
+static void drawSubtitleBar(const std::vector<String>& lines, int idx) {
+    const int subY = 240 - AV_SUB_H;
+    M5.Display.fillRect(0, subY, 320, AV_SUB_H, 0x0841);
+    M5.Display.drawFastHLine(0, subY, 320, COLOR_TEAL);
+    M5.Display.setFont(&fonts::Font2);
+    M5.Display.setTextDatum(middle_center);
+    if (idx >= 0 && idx < (int)lines.size()) {
+        M5.Display.setTextColor(COLOR_WHITE, 0x0841);
+        M5.Display.drawString(lines[idx], 160, subY + 12);
+    }
+    if (idx + 1 < (int)lines.size()) {
+        M5.Display.setTextColor(0x6B6D, 0x0841);
+        M5.Display.drawString(lines[idx + 1], 160, subY + 31);
+    }
+    M5.Display.setTextDatum(top_left);
+    M5.Display.setFont(&fonts::Font0);
+}
+
+// Full avatar screen for the current mood: face, header, subtitle bar, mouth.
+void drawAvatarSpeakingUI(const std::vector<String>& lines, int lineIdx) {
+    if (!avatarLoaded || !poseFullFaces[currentPoseIdx]) {
+        showingAvatar = false;
+        drawChatUI();
+        return;
+    }
+    M5.Display.startWrite();
+    M5.Display.setAddrWindow(0, 0, 320, 240);
+    M5.Display.pushPixels(poseFullFaces[currentPoseIdx], 320UL * 240UL);
+    M5.Display.endWrite();
+
+    M5.Display.fillRect(0, 0, 320, AV_HEADER_H, 0x1082);
+    M5.Display.setTextColor(COLOR_WHITE, 0x1082);
+    M5.Display.setTextSize(1);
+    M5.Display.setCursor(8, 8);
+    M5.Display.printf("MantisKAI  [%s]", POSE_NAMES[currentPoseIdx]);
+
+    drawSubtitleBar(lines, lineIdx);
+    animateMouthHQ(currentPoseIdx);
+}
 
 // ---------- Slots economy + reels (art: lemon, 7, cherry, girl, jackpot) ----------
 enum SlotSym { SYM_LEMON = 0, SYM_SEVEN, SYM_CHERRY, SYM_GIRL, SYM_JACKPOT, SYM_COUNT };
@@ -1241,6 +1689,20 @@ void sendChat(const String& msg) {
             if (doc["reply"].is<const char*>()) {
                 lastReply = doc["reply"].as<String>();
                 replyPage = 0;
+                // Per-chunk moods from server (optional; keeps Base if absent)
+                replyMoodCount = 0;
+                currentPoseIdx = 0;
+                if (doc["moods"].is<JsonArray>()) {
+                    for (JsonVariant v : doc["moods"].as<JsonArray>()) {
+                        if (replyMoodCount >= MOOD_MAX) break;
+                        if (v.is<const char*>()) {
+                            replyMoods[replyMoodCount++] = moodNameToIdx(v.as<const char*>());
+                        }
+                    }
+                    if (replyMoodCount > 0) currentPoseIdx = replyMoods[0];
+                    Serial.printf("[AVATAR] moods x%d first=%s\n",
+                                  replyMoodCount, POSE_NAMES[currentPoseIdx]);
+                }
                 isBusy = false;
                 activeSprite = SPRITE_NONE;
                 drawChatUI();
@@ -1272,7 +1734,26 @@ void sendChat(const String& msg) {
 }
 
 // Fetch one TTS chunk into buf. Returns bytes, sets sampleRate/more. <0 on fail.
-static int fetchTtsChunk(const String& text, int chunkIdx, uint8_t* buf, int maxBytes,
+// %XX-decode the X-Text header (the words in this TTS chunk) for subtitles.
+static String urlDecode(const String& in) {
+    String out;
+    out.reserve(in.length());
+    for (size_t i = 0; i < in.length(); i++) {
+        char c = in[i];
+        if (c == '%' && i + 2 < in.length()) {
+            char h[3] = { in[i + 1], in[i + 2], 0 };
+            out += (char)strtol(h, nullptr, 16);
+            i += 2;
+        } else if (c == '+') {
+            out += ' ';
+        } else {
+            out += c;
+        }
+    }
+    return out;
+}
+
+static int fetchTtsChunk(const String& text, int chunkIdx, uint8_t* buf, int maxBytes, String& chunkText, String& visemes,
                          int& sampleRate, int& more) {
     sampleRate = 22050;
     more = 0;
@@ -1288,8 +1769,8 @@ static int fetchTtsChunk(const String& text, int chunkIdx, uint8_t* buf, int max
     http.addHeader("Content-Type", "application/json");
     // HTTPClient only keeps response headers it was told to collect.
     // Without this, X-Sample-Rate and X-More were always ignored.
-    const char* wantHeaders[] = { "X-Sample-Rate", "X-More" };
-    http.collectHeaders(wantHeaders, 2);
+    const char* wantHeaders[] = { "X-Sample-Rate", "X-More", "X-Text", "X-Visemes" };
+    http.collectHeaders(wantHeaders, 4);
 
     JsonDocument body;
     body["text"] = text;
@@ -1307,6 +1788,8 @@ static int fetchTtsChunk(const String& text, int chunkIdx, uint8_t* buf, int max
     }
     more = 1;
     if (http.hasHeader("X-More")) more = http.header("X-More").toInt();
+    chunkText = http.hasHeader("X-Text") ? urlDecode(http.header("X-Text")) : String("");
+    visemes   = http.hasHeader("X-Visemes") ? http.header("X-Visemes") : String("");
 
     // Read the whole chunk. If it would not fit, say so instead of silently
     // dropping the end of the sentence.
@@ -1337,17 +1820,31 @@ static int fetchTtsChunk(const String& text, int chunkIdx, uint8_t* buf, int max
     return got;
 }
 
+// Background fetch of the next TTS chunk while the current one plays, so the mouth and the
+// subtitles keep moving during the server's synthesis (an HTTP POST blocks until it answers).
+struct TtsPrefetch {
+    String text;
+    int chunk = 0, maxBytes = 0, got = 0, rate = 22050, more = 0;
+    uint8_t* buf = nullptr;
+    String chunkText, visemes;
+    volatile bool done = true;
+};
+static TtsPrefetch ttsNext;
+
+static void ttsPrefetchTask(void*) {
+    ttsNext.got = fetchTtsChunk(ttsNext.text, ttsNext.chunk, ttsNext.buf, ttsNext.maxBytes, ttsNext.chunkText,
+                                ttsNext.visemes, ttsNext.rate, ttsNext.more);
+    ttsNext.done = true;
+    vTaskDelete(nullptr);
+}
+
 void fetchAndPlayTTS(const String& text) {
-    // Seamless chunked playback: prefetch next chunk while current plays.
-    // No artificial gaps, no busy animation during speech.
+    // Chunked playback with the avatar: the mouth follows the audio (20 ms envelope), the mood
+    // changes per chunk (server "moods"), and the subtitle shows the line being spoken.
     if (text.length() == 0 || WiFi.status() != WL_CONNECTED) return;
 
-    activeSprite = SPRITE_NONE;  // never animate between TTS chunks
+    activeSprite = SPRITE_NONE;
 
-    // Each buffer must hold a WHOLE chunk. At 22050 Hz mono 16-bit, audio is
-    // 44,100 bytes per second, so the old 120,000-byte buffer held only about
-    // 2.7 s. Anything longer was cut off and the next chunk started early.
-    // 1 MB (in PSRAM) holds about 23 s per chunk.
     const int maxBytes = 1000000;
     uint8_t* bufA = (uint8_t*)ps_malloc(maxBytes);
     uint8_t* bufB = (uint8_t*)ps_malloc(maxBytes);
@@ -1355,9 +1852,10 @@ void fetchAndPlayTTS(const String& text) {
     if (!bufB) { free(bufA); return; }
 
     int sampleRate = 22050, more = 0;
-    int got = fetchTtsChunk(text, 0, bufA, maxBytes, sampleRate, more);
-    Serial.printf("[TTS] chunk 0: %d bytes @ %d Hz (%.1f s)\n",
-                  got, sampleRate, got / 2.0f / sampleRate);
+    String chunkText, visemes;
+    static VisemeTrack visTrack;  // static: ~1.2 KB kept off the loop task's stack
+    int got = fetchTtsChunk(text, 0, bufA, maxBytes, chunkText, visemes, sampleRate, more);
+    Serial.printf("[TTS] chunk 0: %d bytes @ %d Hz (%.1f s)\n", got, sampleRate, got / 2.0f / sampleRate);
     if (got < 512) {
         free(bufA); free(bufB);
         return;
@@ -1375,56 +1873,107 @@ void fetchAndPlayTTS(const String& text) {
     M5.Speaker.begin();
     M5.Speaker.setVolume(200);
 
-    const uint8_t TTS_CH = 0;  // always the same speaker channel
+    showingAvatar = avatarLoaded;
+    const uint8_t TTS_CH = 0;
 
     while (true) {
         size_t samples = (size_t)playBytes / 2;
-        // How long this chunk takes to play, from its own sample count.
         unsigned long playMs = (unsigned long)((uint64_t)samples * 1000ULL / (uint32_t)playRate);
+        if (chunkText.length() == 0) chunkText = (chunkIdx == 0) ? text : String(""); // older server
+        std::vector<String> lines = wrapSubtitle(chunkText, avParams.lineChars);
+        int envCount = 0;
+        float* env = avatarLoaded ? buildMouthEnvelope((const int16_t*)playBuf, samples, playRate, envCount) : nullptr;
+
+        decodeVisemes(visemes, visTrack);           // empty when the server sends no X-Visemes
+        const bool shaped = avatarLoaded && visTrack.n > 0;
+        float shOpen = 0.0f, shWidth = 0.0f;
+        unsigned long lastShapeMs = 0;
+
+        applyMoodForChunk(chunkIdx);
+        int lineIdx = 0;
+        voiceIntensity = 0.0f;
+        if (showingAvatar) drawAvatarSpeakingUI(lines, lineIdx);
+
         unsigned long playStart = millis();
         bool started = M5.Speaker.playRaw((const int16_t*)playBuf, samples,
                                           (uint32_t)playRate, false, 1, TTS_CH, false);
-        Serial.printf("[TTS] play chunk %d: %u samples, %lu ms, started=%d\n",
-                      chunkIdx, (unsigned)samples, playMs, started);
+        Serial.printf("[TTS] play chunk %d: %u samples, %lu ms, started=%d, %u lines\n",
+                      chunkIdx, (unsigned)samples, playMs, started, (unsigned)lines.size());
 
-        // Prefetch next chunk while this one plays (download only, no playback)
-        int nextGot = 0, nextRate = playRate, nextMore = 0;
-        bool prefetched = false;
+        // fetch the next chunk in the background while this one plays
+        bool prefetching = false;
         if (hasMore) {
-            nextGot = fetchTtsChunk(text, chunkIdx + 1, nextBuf, maxBytes, nextRate, nextMore);
-            Serial.printf("[TTS] chunk %d: %d bytes @ %d Hz (%.1f s)\n", chunkIdx + 1,
-                          nextGot, nextRate, nextGot / 2.0f / nextRate);
-            prefetched = (nextGot >= 512);
+            ttsNext.text = text;
+            ttsNext.chunk = chunkIdx + 1;
+            ttsNext.buf = nextBuf;
+            ttsNext.maxBytes = maxBytes;
+            ttsNext.got = 0;
+            ttsNext.rate = playRate;
+            ttsNext.more = 0;
+            ttsNext.done = false;
+            prefetching = xTaskCreatePinnedToCore(ttsPrefetchTask, "ttsNext", 8192, nullptr, 1, nullptr, 0) == pdPASS;
+            if (!prefetching) ttsNext.done = true;
         }
 
-        // Do not start the next chunk until BOTH are true:
-        //   1. the speaker says this channel is finished, and
-        //   2. the full length of this chunk has actually elapsed (+150 ms tail).
-        // Waiting on isPlaying() alone let the next chunk start while the
-        // current one was still audible; the elapsed-time check prevents that.
-        unsigned long reportedDoneMs = 0;
+        unsigned long lastDraw = 0;
         while (true) {
-            bool playing = M5.Speaker.isPlaying(TTS_CH);
             unsigned long elapsed = millis() - playStart;
-            if (!playing && reportedDoneMs == 0) reportedDoneMs = elapsed;
-            if (!playing && elapsed >= playMs + 150) break;
-            delay(5);
+            bool playing = M5.Speaker.isPlaying(TTS_CH);
+            bool audioDone = !playing && elapsed >= playMs + 150;
+            if (audioDone && (!prefetching || ttsNext.done)) break;
+
+            if (showingAvatar) {
+                voiceIntensity = audioDone ? 0.0f : mouthIntensityAt(env, envCount, elapsed);
+                int li = subtitleLineAt(lines, min(elapsed, playMs), playMs);
+                if (li != lineIdx) {
+                    lineIdx = li;
+                    drawSubtitleBar(lines, lineIdx);
+                }
+                if (millis() - lastDraw >= 33) { // ~30 fps mouth
+                    lastDraw = millis();
+                    if (shaped) {
+                        // shape from Piper's phonemes, eased; loudness adds emphasis (DEVICE-MATCH: preview _tick)
+                        int v = audioDone ? 0 : visemeAt(visTrack, elapsed + avParams.lookaheadMs);
+                        float dt = (float)(elapsed - lastShapeMs);
+                        lastShapeMs = elapsed;
+                        shOpen  = visEase(shOpen,  visTable[v][0], dt, avParams.attack);
+                        shWidth = visEase(shWidth, visTable[v][1], dt, avParams.attack);
+                        int ei = (int)((elapsed + avParams.lookaheadMs) / AV_ENV_STEP_MS);
+                        float e = (env && envCount > 0) ? env[ei < envCount ? ei : envCount - 1] : 0.0f;
+                        animateMouthShape(currentPoseIdx, shOpen * (0.6f + 0.4f * e), shWidth);
+                    } else {
+                        animateMouthHQ(currentPoseIdx);
+                    }
+                }
+            }
             M5.update();
+            delay(5);
         }
-        Serial.printf("[TTS] chunk %d done: isPlaying went false at %lu ms, expected %lu ms\n",
-                      chunkIdx, reportedDoneMs, playMs);
+        if (env) free(env);
 
-        if (!hasMore || !prefetched) break;
+        if (!hasMore || !prefetching || ttsNext.got < 512) break;
 
-        // Swap — next chunk already in nextBuf, play immediately
         uint8_t* tmp = playBuf;
         playBuf = nextBuf;
         nextBuf = tmp;
-        playBytes = nextGot;
-        playRate = nextRate;
-        hasMore = nextMore;
+        playBytes = ttsNext.got;
+        playRate = ttsNext.rate;
+        hasMore = ttsNext.more;
+        chunkText = ttsNext.chunkText;
+        visemes = ttsNext.visemes;
         chunkIdx++;
+        Serial.printf("[TTS] chunk %d: %d bytes @ %d Hz (%.1f s)\n", chunkIdx, playBytes, playRate,
+                      playBytes / 2.0f / playRate);
     }
+
+    // Speech finished: close the mouth, then restore the normal reply window
+    if (showingAvatar) {
+        voiceIntensity = 0.0f;
+        animateMouthHQ(currentPoseIdx);
+        delay(120);
+    }
+    showingAvatar = false;
+    drawChatUI();   // back to paged text reply + TYPE / MIC
 
     free(bufA);
     free(bufB);
@@ -1828,6 +2377,10 @@ void setup() {
     randomSeed(esp_random());
     loadSettings();
     loadWordListsFromSD();
+    // Avatar assets live on SD; load after word-lists (which also touches SD)
+    if (SD.begin(4)) {
+        loadAsymmetricAssets();
+    }
     connectWiFi();
     syncServerState();
     drawChatUI();

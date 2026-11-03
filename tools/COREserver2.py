@@ -1,6 +1,6 @@
 """
 MantisKAI PC Bridge
-  POST /api/chat   → {"reply": "...", "lora": "..."}          small JSON
+  POST /api/chat   → {"reply": "...", "lora": "...", "moods": [...]}  small JSON
   POST /api/tts    → raw WAV bytes                             binary
   POST /api/stt    → {"text": "..."}                           accepts binary WAV/PCM
   POST /api/image  → {"image_base64": "...", "lora": "..."}
@@ -347,6 +347,119 @@ def api_lora():
     print(f"[LoRA] → {name}")
     return jsonify({"lora": name, "index": active_lora_idx, "list": LORA_LIST})
 
+
+def split_tts_chunks(text, max_chars=140):
+    text = (text or "").strip()
+    if not text:
+        return []
+    chunks = []
+    remaining = text
+    punct = set(".!?;:")
+    while remaining:
+        if len(remaining) <= max_chars:
+            chunks.append(remaining.strip())
+            break
+        window = remaining[:max_chars]
+        best = -1
+        for i in range(len(window) - 1, max_chars // 2 - 1, -1):
+            if window[i] in punct:
+                best = i + 1
+                break
+        if best < 0:
+            for i in range(len(window) - 1, max_chars // 2 - 1, -1):
+                if window[i] == " ":
+                    best = i
+                    break
+        if best < 0:
+            best = max_chars
+        piece = remaining[:best].strip()
+        remaining = remaining[best:].lstrip()
+        if piece:
+            chunks.append(piece)
+    return chunks
+
+
+_MOOD_NAMES = ("base", "accomplished", "excited", "sad", "confused")
+_MOOD_KEYWORDS = {
+    "accomplished": (
+        "turned on", "turned off", "outlet is on", "outlet is off",
+        "plug is on", "plug is off", "done", "completed", "finished",
+        "i did", "all set", "taken care", "executed",
+    ),
+    "excited": (
+        "great", "awesome", "amazing", "wonderful", "love", "happy",
+        "excited", "fantastic", "excellent", "yay", "glad", "perfect",
+    ),
+    "sad": (
+        "sorry", "unfortunately", "can't", "cannot", "unable", "failed",
+        "failure", "sad", "couldn't", "could not", "won't be able",
+    ),
+    "confused": (
+        "not sure", "don't understand", "do not understand", "unclear",
+        "confused", "what do you mean", "could you clarify", "hmm",
+        "i'm not sure", "unsure",
+    ),
+}
+
+
+def score_mood(text):
+    t = (text or "").lower()
+    if not t.strip():
+        return "base", 0
+    scores = {m: 0 for m in _MOOD_NAMES}
+    for mood, kws in _MOOD_KEYWORDS.items():
+        for kw in kws:
+            if kw in t:
+                scores[mood] += 2 if " " in kw else 1
+    if t.count("!") >= 2:
+        scores["excited"] += 1
+    if t.rstrip().endswith("?") and scores["confused"] == 0:
+        scores["confused"] += 1
+    best = max(scores, key=scores.get)
+    return best, scores[best]
+
+
+def opening_mood_from_user(user_message):
+    t = (user_message or "").lower()
+    if any(p in t for p in ("turn on", "turn off", "switch on", "switch off",
+                            "power on", "power off")):
+        return "base"
+    if "?" in t or t.startswith(("what", "why", "how", "when", "where", "who")):
+        return "confused"
+    m, s = score_mood(t)
+    return m if s > 0 else "base"
+
+
+def build_moods(user_message, reply, kasa=False, kasa_ok=True):
+    if kasa:
+        return ["accomplished"] if kasa_ok else ["sad"]
+    chunks = split_tts_chunks(reply)
+    if not chunks:
+        return ["base"]
+    moods = []
+    prev = opening_mood_from_user(user_message)
+    for i, chunk in enumerate(chunks):
+        if i == 0:
+            m, s = score_mood(chunk)
+            if s >= 2:
+                prev = m
+            moods.append(prev)
+        else:
+            m, s = score_mood(chunk)
+            if s >= 2:
+                prev = m
+            moods.append(prev)
+    return moods
+
+
+def chat_payload(reply, lora, user_message="", kasa=False, kasa_ok=True):
+    return {
+        "reply": reply,
+        "lora": lora,
+        "moods": build_moods(user_message, reply, kasa=kasa, kasa_ok=kasa_ok),
+    }
+
+
 @app.route("/api/chat", methods=["POST"])
 def api_chat():
     data = request.json or {}
@@ -362,7 +475,9 @@ def api_chat():
     # Local Kasa HS100 commands are handled directly; no LLM call required.
     kasa_reply = handle_kasa_chat(user_message)
     if kasa_reply is not None:
-        return jsonify({"reply": kasa_reply, "lora": current_lora_name()})
+        ok = "couldn't" not in kasa_reply.lower() and "could not" not in kasa_reply.lower()
+        return jsonify(chat_payload(kasa_reply, current_lora_name(),
+                                    user_message, kasa=True, kasa_ok=ok))
 
 
     chat_history.append({"role": "user", "content": user_message})
@@ -371,7 +486,7 @@ def api_chat():
             model=AI_MODEL, messages=chat_history, temperature=0.7)
         reply = response.choices[0].message.content or ""
         chat_history.append({"role": "assistant", "content": reply})
-        return jsonify({"reply": reply, "lora": current_lora_name()})
+        return jsonify(chat_payload(reply, current_lora_name(), user_message))
     except Exception as e:
         return jsonify({"error": str(e), "lora": current_lora_name()}), 500
 
