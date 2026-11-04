@@ -221,11 +221,11 @@ static void buildPoseField(int i, float splitY) {
 }
 
 bool loadAsymmetricAssets() {
-    if (!SD.exists("/m5_asymmetric_poses.bin")) {
+    if (!SD.exists("/llm/m5_asymmetric_poses.bin")) {
         Serial.println("[AVATAR] m5_asymmetric_poses.bin not found on SD");
         return false;
     }
-    File f = SD.open("/m5_asymmetric_poses.bin", FILE_READ);
+    File f = SD.open("/llm/m5_asymmetric_poses.bin", FILE_READ);
     if (!f) return false;
 
     if (f.read((uint8_t*)&avHeader, sizeof(avHeader)) != sizeof(avHeader)) {
